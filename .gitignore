@@ -1,0 +1,41 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Build outputs and packaged binaries
+build/
+dist/
+*.spec.bak
+
+# Downloaded installers, extracted third-party tools, and test fixtures
+/test_download_pretest/
+/extracted_latest_toolbox/
+/ghost_toolbox_bin/
+/WinUP App Mover V1.6.1/
+*.exe
+*.msi
+*.7z
+*.zip
+
+# Local catalogs, scrape/audit outputs, and generated extraction artifacts
+/app_catalog.json
+/app_catalog_verified.json
+/audit_installers_result.json
+/extracted_all_ghost_urls.json
+/ghost_alive_urls.json
+/ghost_toolbox_urls.json
+/identified_raw.json
+/menu_extracted.json
+/parsed_blocks.json
+/verified_direct_binaries.json
+/winget_verified_manifests.json
+/latest_toolbox.update
+
+# Local logs and editor/OS files
+*.log
+.vscode/
+.DS_Store
+Thumbs.db
