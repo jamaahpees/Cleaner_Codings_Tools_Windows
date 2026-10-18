@@ -1,73 +1,108 @@
 # Dev & AI Cleaner
 
-A Windows desktop utility built with Python and CustomTkinter for reviewing and managing selected cleanup, application, Python-package, startup/service, duplicate-file, and Windows-toolbox tasks. The main entry point is `dev_cleaner.py`.
+Utilitas desktop Windows untuk meninjau sampah/cache, memindahkan dan memulihkan folder aplikasi, mencari duplikat, mengelola paket Python, serta mengakses pengaturan startup, layanan, dan alat Windows. Antarmuka menggunakan **Tkinter/ttkbootstrap dengan adapter kompatibilitas CTk**, bukan aplikasi web.
 
-> **Use with care.** Cleaning, uninstalling, moving applications, changing Windows settings, and running system utilities can affect the operating system and user data. Review selections and confirmation dialogs before proceeding. Keep backups of important data.
+> **Tinjau sebelum bertindak.** Aplikasi dapat menghapus data, mengubah registry/layanan, mencopot paket, dan memindahkan folder aplikasi. Label “Safe” menunjukkan adanya pembatasan, bukan jaminan bebas risiko. Cadangkan data dan uji pada data nonproduksi.
 
-## Current capabilities
+## Enam menu utama
 
-The current application source provides these sections:
+| Menu | Cakupan |
+|---|---|
+| **Smart Cleaner** | Analisis kategori browser/Windows, cache developer, dependensi proyek, dan kandidat registry yatim; pembersihan item terpilih. Smart Scan saat startup bersifat opsional, default **OFF**, satu kali per peluncuran. |
+| **App Mover & Restore** | Kandidat folder aplikasi, pemindahan dengan Robocopy dan junction NTFS, riwayat lokal, restore, serta retry pembersihan pemulihan tertunda. |
+| **Duplicate File Finder (Safe)** | Pemindaian folder terpilih dan pemindahan duplikat terpilih ke Recycle Bin dengan pembatasan file/lokasi. |
+| **Python Library Manager** | Penemuan interpreter, daftar paket/dependensi, dan uninstall melalui interpreter yang dipilih, dengan verifikasi setelah tindakan. |
+| **Startup & Windows Services** | Subview program startup dan layanan Windows; tindakan yang tersedia bergantung pada izin dan status aktual. |
+| **System Toolbox (Tweaks & Tools)** | App Setup, Windows Tweaks, System Health & WinSxS, Essential Runtimes, dan App Link Checker. |
 
-- **Smart Cleaner** — scans configured browser, temporary, developer-cache/project, and selected registry-orphan categories; presents findings before cleanup. Includes an optional startup Smart Scan (default OFF, persistent in user preferences) and removes only verified cleaned rows without automatic rescans.
-- **App Mover & Restore** — standalone directory mover and restorer within Cleaner; moves eligible application folders using Robocopy and NTFS directory junctions (`mklink /J`). Preserves durable recovery state (`restored_pending_cleanup`) and supports explicit cleanup retry without recopying.
-- **Python Library Manager** — discovers Python environments and lists installed packages; verifies removal through the selected interpreter's `importlib.metadata` and updates UI rows in-place without triggering automatic rescans.
-- **Startup & Windows Services** — displays startup entries and Windows services; updates status in-place upon verified action without full rescans.
-- **Duplicate File Finder** — scans a selected location, safely moves selected duplicates to the Recycle Bin, and updates local group state without rescanning.
-- **Ghost Toolbox** — includes links and Windows utility/tweak actions; internal console subprocesses run silently with hidden console windows (`CREATE_NO_WINDOW`).
-- **Application-wide Mutation Guard** — serializes destructive operations and prevents scans and mutations from interfering with each other.
+**Katalog publik tidak dibundel.** App Setup dapat tampil kosong pada checkout bersih; ini bukan katalog unduhan yang hilang karena instalasi gagal. Jangan mengambil katalog privat atau installer tidak tepercaya untuk mengisinya. Lihat [panduan pengguna](docs/USER_GUIDE.md).
 
-Feature details vary by Windows version, permissions, available system tools, and selected environment. This repository is an early-stage utility; inspect the source and test carefully before using operations that modify the system.
+## Tampilan aplikasi
 
-## Requirements
+UI asli dengan data demonstrasi. Angka, nama berkas, dan hasil pada gambar bukan hasil pengukuran perangkat Anda.
 
-- Windows 10/11 (Windows-specific registry, junction, service, and system-tool integrations are used).
-- Python 3.10 or later for source execution (the provided launcher also checks for Python; PyInstaller builds may run without a separate Python installation).
-- Runtime Python packages: `customtkinter`, `psutil`, and `send2trash`.
-- Optional system tools used by individual actions may include `robocopy`, `cmd.exe`, `mklink`, `winget`, `sc.exe`, `powercfg`, `dism`, and `sfc`.
-- Administrator privileges are required for some system-level actions, including App Mover operations.
+![Smart Cleaner — UI asli dengan data demonstrasi](docs/images/smart-cleaner.png)
 
-## Run from source
+<details>
+<summary>Lihat lima menu lainnya</summary>
 
-Create and activate a virtual environment, then install the runtime dependencies:
+### App Mover & Restore
+![App Mover & Restore — UI asli dengan data demonstrasi](docs/images/app-mover.png)
+
+### Duplicate File Finder (Safe)
+![Duplicate File Finder (Safe) — UI asli dengan data demonstrasi](docs/images/duplicates.png)
+
+### Python Library Manager
+![Python Library Manager — UI asli dengan data demonstrasi](docs/images/python-libraries.png)
+
+### Startup & Windows Services
+![Startup & Windows Services — UI asli dengan data demonstrasi](docs/images/startup-services.png)
+
+### System Toolbox (Tweaks & Tools)
+![System Toolbox — UI asli dengan data demonstrasi](docs/images/system-toolbox.png)
+
+</details>
+
+Konteks pengambilan gambar tersedia di [catatan screenshot](docs/SCREENSHOTS.md).
+
+## Status dukungan dan verifikasi
+
+- **Target:** Windows 10/11 **x64**, Python 3.10+ untuk menjalankan sumber. Gunakan Python x64 dengan Tkinter tersedia.
+- **Lingkungan yang diamati:** Windows 11 build 26300, Python 3.11.9 AMD64; GUI smoke lokal, bukan sertifikasi seluruh fitur.
+- **Baseline pengujian:** 74 tes otomatis lulus pada baseline sebelum perubahan publikasi ini; jumlah itu bukan bukti pengujian seluruh operasi Windows nyata. Hasil perubahan terbaru perlu dicatat oleh kontributor.
+- **Belum diverifikasi:** Windows 10 secara langsung, VM bersih, ARM/32-bit, variasi DPI/multimonitor, serta kompatibilitas semua aplikasi yang dipindahkan.
+- Tidak ada klaim peningkatan performa, penghematan RAM universal, build reproduktif, executable bertanda tangan, atau pipeline CI yang terverifikasi.
+
+## Mulai dari sumber
+
+Jalankan perintah berikut di **PowerShell**, dari direktori proyek. Cara ini tidak membutuhkan aktivasi virtual environment atau perubahan execution policy.
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install customtkinter psutil send2trash pyinstaller
-python dev_cleaner.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install ttkbootstrap psutil send2trash
+.\.venv\Scripts\python.exe dev_cleaner.py
 ```
 
-The `Run-Dev-Cleaner.bat` launcher is also provided. Review it before use: it installs some dependencies with pip and starts the GUI using `pythonw`.
+Paket diunduh dari indeks pip yang dikonfigurasi. Versi belum dikunci; baca [instalasi dan build](docs/INSTALLATION.md) untuk batas reproduktibilitas dan dependensi build tambahan. Jalankan awalnya tanpa hak Administrator. Beberapa tindakan, khususnya App Mover dan perubahan sistem, membutuhkan elevasi.
 
-## Build a Windows executable
-
-With the dependencies installed, build from the project directory:
+Untuk peluncuran tanpa terminal setelah dependensi tersedia:
 
 ```powershell
-pyinstaller --clean --noconfirm Dev-AI-Cleaner.spec
+.\.venv\Scripts\pythonw.exe Run-Dev-Cleaner.pyw
 ```
 
-The PyInstaller specification is configured for a windowed application (`console=False`). Build output is generated under `build/` and `dist/`; these directories are intentionally excluded from version control.
+Launcher `.bat` lama memasang sebagian dependensi melalui pip dan belum mencakup runtime ttkbootstrap/psutil secara lengkap. Gunakan langkah virtual environment di atas sebagai rute utama.
 
-## Local data
+## Build lokal (opsional)
 
-The application stores App Mover history, registry backups, and Python Library Manager diagnostics under `%LOCALAPPDATA%\DevAICleaner`. It may also read the legacy `C:\ProgramData\WinUP\AppMover\moves.json` history file if present. Do not commit these local files.
+PyInstaller adalah **dependensi build**, bukan syarat menjalankan sumber. Spec saat ini juga mengoleksi CustomTkinter/darkdetect dan modul pywin32 walaupun widget utama memakai adapter ttkbootstrap.
 
-## Safety and privacy notes
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller customtkinter darkdetect pywin32
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm Dev-AI-Cleaner.spec
+```
 
-- The application is a local desktop utility; this project documentation does not guarantee the behavior or safety of downloaded tools linked by the toolbox.
-- Avoid running unknown installers or commands. Verify sources independently.
-- Review the selected rows and target paths before cleanup or move/restore operations.
-- Registry changes and system cleanup can have lasting effects; maintain backups and use a non-production/test environment where possible.
-- Some operations may require elevated privileges. Grant them only when necessary and when you understand the operation.
+Keluaran yang dikonfigurasi: `dist/Dev-AI-Cleaner.exe`, mode GUI (`console=False`). Build harus dijalankan dan diuji di Windows; perintah ini bukan klaim bahwa tersedia rilis biner resmi. Audit lisensi dependensi dan hasil bundel sebelum mendistribusikan executable.
 
-## Roadmap
+## Keselamatan, data, dan jaringan
 
-Planned work, not yet represented as completed functionality, includes optional one-shot Smart Scan on startup, success-only in-place UI updates without action-triggered rescans, broader terminal-window suppression for child processes, packaging cleanup, and a lightweight CustomTkinter visual refresh. See [PRD](docs/PRD.md) and [Tech Stack](docs/TECH_STACK.md).
+Riwayat pemindahan, preferensi, backup registry, dan log diagnostik Python berada di `%LOCALAPPDATA%\DevAICleaner`. Unduhan installer, bila fitur diberi katalog lokal tepercaya, menggunakan `%USERPROFILE%\Downloads\Cleaner_App_Installers`. Jangan menghapus riwayat App Mover saat masih ada folder yang dipindahkan atau pemulihan tertunda.
 
-## Project documents
+Pemindaian inti bekerja lokal. Pemeriksaan tautan menghubungi URL yang dimasukkan; tautan runtime membuka browser; pengunduhan/installer dan utilitas Windows dapat menggunakan jaringan serta mempunyai kebijakan sendiri. Tidak ada layanan akun/telemetri aplikasi yang dinyatakan dalam sumber yang ditinjau; ini bukan jaminan bahwa OS, pip, atau alat pihak ketiga tidak berkomunikasi keluar.
 
-- [Product Requirements Document](docs/PRD.md)
-- [Technical Stack](docs/TECH_STACK.md)
-- [No-rescan and App Mover design note](docs/plans/2026-10-17-no-rescan-and-app-mover-design.md)
+Baca [keselamatan dan privasi](docs/SAFETY_AND_PRIVACY.md) sebelum tindakan destruktif. Hasil tindakan yang gagal/tidak terverifikasi dipertahankan pada alur inti; gunakan refresh/pemindaian manual untuk melihat perubahan eksternal. Pengaman mutasi tidak menggantikan backup dan tidak menjamin serialisasi semua alat eksternal pada toolbox.
+
+## Dokumentasi dan kontribusi
+
+- [Panduan pengguna: enam menu dan subview](docs/USER_GUIDE.md)
+- [Instalasi, pengujian, dan build](docs/INSTALLATION.md)
+- [Keselamatan dan privasi](docs/SAFETY_AND_PRIVACY.md)
+- [Pemecahan masalah](docs/TROUBLESHOOTING.md)
+- [PRD](docs/PRD.md) · [Tech Stack](docs/TECH_STACK.md)
+- [Kontribusi](CONTRIBUTING.md) · [Pelaporan keamanan](SECURITY.md) · [Changelog](CHANGELOG.md)
+- [Pemberitahuan pihak ketiga](docs/THIRD_PARTY_NOTICES.md)
+
+## Lisensi
+
+Kontribusi asli proyek dilisensikan dengan [MIT](LICENSE), tanpa jaminan. Dependensi, aset, merek, dan kode pihak ketiga tetap tunduk pada hak/lisensinya sendiri. MIT proyek tidak membuktikan hak atas kode eksternal; pemeriksaan asal-usul dan inventaris bundel tetap merupakan gerbang sebelum publikasi biner.

@@ -1,7 +1,7 @@
 """
-Dev & AI CLI Cleaner + App Mover & CCleaner Suite
-Refactored UI: Full Left-Side Vertical Navigation Menu (CCleaner Style)
-With WinUP Table List Layout, Smart Scanner, Safe Registry Cleaner,
+Dev & AI CLI Cleaner + App Mover Suite
+Refactored UI: Full Left-Side Vertical Navigation Menu (Compact Layout)
+With Compact Table List Layout, Smart Scanner, Safe Registry Cleaner,
 and Startup & Windows Services Manager.
 """
 
@@ -27,14 +27,395 @@ from concurrent.futures import ThreadPoolExecutor
 import psutil
 import ctypes
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import customtkinter as ctk
+from tkinter import ttk, messagebox, filedialog, font as tkfont
+
+
+UI_COLORS = {
+    "background": "#101827", "sidebar": "#0B1220", "card": "#182438",
+    "header": "#203149", "border": "#34445B", "text": "#E8EEF7",
+    "muted": "#A8B7CB", "primary": "#2DD4BF", "ink": "#062A27",
+    "success": "#4ADE80", "warning": "#FBBF24", "danger": "#F87171",
+}
+# Translate legacy presentation colors in one place; scan metadata remains unchanged.
+LEGACY_COLORS = {
+    "#18191c": "card", "#1e2024": "background", "#141517": "sidebar",
+    "#111827": "sidebar", "#0f172a": "header", "#1e293b": "header",
+    "#334155": "border", "#94a3b8": "muted", "#64748b": "muted",
+    "#e2e8f0": "text", "#ffffff": "text", "#38bdf8": "primary",
+    "#0284c7": "primary", "#0369a1": "primary", "#16a34a": "success",
+    "#dc2626": "danger", "#ea580c": "warning", "#ca8a04": "warning",
+}
+
+
+def ui_color(value):
+    return UI_COLORS.get(LEGACY_COLORS.get(str(value).lower()), value)
+
+
+def parent_background(master):
+    try:
+        return master.cget("background")
+    except (tk.TclError, AttributeError):
+        return UI_COLORS["background"]
+
+
+def character_width(master, pixels, font=None, inset=0):
+    """CTk dimensions are pixels; ttk text-widget widths are font characters."""
+    metrics = tkfont.Font(master=master, font=font or ("Segoe UI", 10))
+    return max(0, round((float(pixels) - inset) / max(1, metrics.measure("0"))))
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+from ttkbootstrap.widgets import ScrolledFrame, ScrolledText
 from send2trash import send2trash
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
 
-PROTECTED_PACKAGES = {"pip", "setuptools", "wheel", "customtkinter", "send2trash", "darkdetect", "psutil"}
+class CTk:
+    """ttkbootstrap Window adapter maintaining compatibility and super-lightweight RAM footprint."""
+    pass
+
+
+class _BootstrapUIAdapter:
+    """Modern Bootstrap Desktop Adapter powered by ttkbootstrap."""
+
+    Window = tb.Window
+
+    @staticmethod
+    def set_appearance_mode(mode):
+        pass
+
+    @staticmethod
+    def set_default_color_theme(theme):
+        pass
+
+    @staticmethod
+    def _filter_allowed_kwargs(widget_cls, kwargs, extra_strip=None):
+        strip = {
+            "fg_color", "text_color", "corner_radius", "hover_color", "border_color",
+            "border_width", "progress_color", "segmented_button_selected_color",
+            "segmented_button_selected_hover_color", "segmented_button_unselected_color",
+            "segmented_button_unselected_hover_color", "button_color", "button_hover_color",
+            "dropdown_fg_color", "dropdown_hover_color", "dropdown_text_color",
+            "checkbox_width", "checkbox_height", "radiobutton_width", "radiobutton_height",
+            "hover", "state_color"
+        }
+        if extra_strip:
+            strip.update(extra_strip)
+        res = {}
+        for k, v in kwargs.items():
+            if k in strip:
+                continue
+            res[k] = v
+        return res
+
+    @staticmethod
+    def _clean_tk_kwargs(kwargs, remove_height=False, remove_font=False):
+        strip = {
+            "fg_color", "text_color", "corner_radius", "hover_color", "border_color",
+            "border_width", "progress_color", "segmented_button_selected_color",
+            "segmented_button_selected_hover_color", "segmented_button_unselected_color",
+            "segmented_button_unselected_hover_color", "button_color", "button_hover_color",
+            "dropdown_fg_color", "dropdown_hover_color", "dropdown_text_color",
+            "checkbox_width", "checkbox_height", "radiobutton_width", "radiobutton_height",
+            "hover", "state_color", "anchor"
+        }
+        res = {k: v for k, v in kwargs.items() if k not in strip}
+        if remove_height:
+            res.pop("height", None)
+        if remove_font:
+            res.pop("font", None)
+        return res
+
+    @staticmethod
+    def _text_options(master, kwargs, styled=False, inset=16):
+        font = kwargs.get("font") or ("Segoe UI", 10)
+        kw = _BootstrapUIAdapter._clean_tk_kwargs(kwargs, remove_height=True, remove_font=styled)
+        if "width" in kw:
+            kw["width"] = character_width(master, kw["width"], font, inset)
+        if not styled:
+            kw["font"] = font
+        return kw
+
+    @staticmethod
+    def _font_style(widget, font):
+        if font:
+            base = widget.cget("style") or widget.winfo_class()
+            name = f"Compact{str(font).encode().hex()}.{base}"
+            tb.Style().configure(name, font=font, padding=(8, 5))
+            widget.configure(style=name)
+
+    class CTk(tb.Window):
+        def __init__(self, *args, **kwargs):
+            themename = kwargs.pop("themename", "darkly")
+            super().__init__(*args, themename=themename, **kwargs)
+            self.configure(background=UI_COLORS["background"])
+            style = tb.Style()
+            style.configure(".", font=("Segoe UI", 10), background=UI_COLORS["background"], foreground=UI_COLORS["text"])
+            for kind in ("TButton", "TMenubutton"):
+                style.configure(kind, padding=(8, 5), font=("Segoe UI", 10))
+            style.configure("TCheckbutton", background=UI_COLORS["card"], font=("Segoe UI", 10))
+            for semantic in ("primary", "success", "warning", "danger", "secondary"):
+                color = UI_COLORS.get(semantic, UI_COLORS["border"])
+                for kind in ("TButton", "TMenubutton"):
+                    name = f"{semantic}.{kind}"
+                    style.configure(name, background=color, foreground=UI_COLORS["ink"], padding=(8, 5))
+                    style.map(name, background=[("disabled", UI_COLORS["border"]), ("pressed", UI_COLORS["muted"]), ("active", UI_COLORS["text"])], foreground=[("disabled", UI_COLORS["muted"]), ("active", UI_COLORS["ink"])])
+
+    class CTkFrame(tk.Frame):
+        def __init__(self, master=None, corner_radius=None, fg_color=None, border_width=None, border_color=None, **kwargs):
+            kwargs.pop("bootstyle", None)
+            bg = ui_color(fg_color) or UI_COLORS["card"]
+            if bg == "transparent":
+                try:
+                    bg = master.cget("bg")
+                except Exception:
+                    bg = "#14171d"
+            bd = border_width or 0
+            hl = ui_color(border_color) or UI_COLORS["border"]
+            kwargs.pop("border_color", None)
+            kwargs.pop("border_width", None)
+            kwargs.pop("corner_radius", None)
+            kwargs.pop("fg_color", None)
+            super().__init__(master, bg=bg, highlightthickness=bd, highlightbackground=hl, **kwargs)
+
+        def configure(self, cnf=None, **kwargs):
+            if cnf and isinstance(cnf, dict):
+                kwargs.update(cnf)
+            fg = kwargs.pop("fg_color", None)
+            if fg:
+                if fg == "transparent":
+                    try:
+                        fg = self.master.cget("bg")
+                    except Exception:
+                        fg = "#14171d"
+                self.config(bg=ui_color(fg))
+            bd = kwargs.pop("border_width", None)
+            if bd is not None:
+                self.config(highlightthickness=bd)
+            bc = kwargs.pop("border_color", None)
+            if bc is not None:
+                self.config(highlightbackground=bc)
+            kwargs.pop("corner_radius", None)
+            kwargs.pop("bootstyle", None)
+            super().configure(**kwargs)
+
+    class CTkScrollableFrame(ScrolledFrame):
+        def __init__(self, master=None, corner_radius=None, fg_color=None, **kwargs):
+            kw = _BootstrapUIAdapter._clean_tk_kwargs(kwargs)
+            super().__init__(master, autohide=True, **kw)
+
+    class CTkLabel(tb.Label):
+        def __init__(self, master=None, text="", font=None, text_color=None, fg_color=None, **kwargs):
+            kwargs.pop("bootstyle", None)
+            kwargs.pop("corner_radius", None)
+            kwargs.pop("height", None)
+            self._pixel_width = kwargs.pop("width", None)
+            self._label_font = font or ("Segoe UI", 10)
+            bg = parent_background(master) if fg_color in (None, "transparent") else ui_color(fg_color)
+            fg = ui_color(text_color) if text_color else UI_COLORS["text"]
+            if bg in (UI_COLORS["success"], UI_COLORS["warning"], UI_COLORS["danger"], UI_COLORS["primary"]):
+                fg = UI_COLORS["ink"]
+            if self._pixel_width is not None:
+                kwargs["width"] = character_width(master, self._pixel_width, self._label_font)
+            super().__init__(master, text=text, font=self._label_font, background=bg, foreground=fg, **kwargs)
+
+        def configure(self, cnf=None, **kwargs):
+            if isinstance(cnf, str):
+                return super().configure(cnf)
+            if isinstance(cnf, dict):
+                kwargs.update(cnf)
+            if "font" in kwargs:
+                self._label_font = kwargs["font"]
+            if "width" in kwargs:
+                self._pixel_width = kwargs.pop("width")
+            if self._pixel_width is not None:
+                kwargs["width"] = character_width(self.master, self._pixel_width, self._label_font)
+            if "text_color" in kwargs:
+                kwargs["foreground"] = ui_color(kwargs.pop("text_color"))
+            if "fg_color" in kwargs:
+                color = kwargs.pop("fg_color")
+                kwargs["background"] = parent_background(self.master) if color == "transparent" else ui_color(color)
+                if kwargs["background"] in (UI_COLORS["success"], UI_COLORS["warning"], UI_COLORS["danger"], UI_COLORS["primary"]):
+                    kwargs["foreground"] = UI_COLORS["ink"]
+            background = kwargs.get("background", self.cget("background"))
+            if background in (UI_COLORS["success"], UI_COLORS["warning"], UI_COLORS["danger"], UI_COLORS["primary"]):
+                kwargs["foreground"] = UI_COLORS["ink"]
+            kwargs.pop("height", None)
+            kwargs.pop("corner_radius", None)
+            return super().configure(**kwargs)
+
+    class CTkButton(tb.Button):
+        def __init__(self, master=None, text="", command=None, fg_color=None, hover_color=None, **kwargs):
+            bootstyle = kwargs.pop("bootstyle", "")
+            cursor = kwargs.pop("cursor", "hand2")
+            if not bootstyle:
+                fg = fg_color or kwargs.pop("fg_color", None)
+                if fg:
+                    fgl = str(fg).lower()
+                    if "dc2626" in fgl or "b91c1c" in fgl or "red" in fgl:
+                        bootstyle = "danger"
+                    elif "ea580c" in fgl or "orange" in fgl:
+                        bootstyle = "warning"
+                    elif "16a34a" in fgl or "green" in fgl:
+                        bootstyle = "success"
+                    elif "transparent" in fgl or "334155" in fgl or "272a30" in fgl:
+                        bootstyle = "secondary-outline"
+                    else:
+                        bootstyle = "primary"
+                else:
+                    bootstyle = "primary"
+            kw = _BootstrapUIAdapter._text_options(master, kwargs, styled=True)
+            super().__init__(master, text=text, command=command, bootstyle=bootstyle, cursor=cursor, **kw)
+            _BootstrapUIAdapter._font_style(self, kwargs.get("font"))
+
+        def configure(self, cnf=None, **kwargs):
+            if cnf and isinstance(cnf, dict):
+                kwargs.update(cnf)
+            fg = kwargs.pop("fg_color", None)
+            tc = kwargs.pop("text_color", None)
+            if fg:
+                fgl = str(fg).lower()
+                if "transparent" in fgl:
+                    kwargs["bootstyle"] = "secondary-outline"
+                elif "dc2626" in fgl or "red" in fgl:
+                    kwargs["bootstyle"] = "danger"
+                elif "16a34a" in fgl or "green" in fgl:
+                    kwargs["bootstyle"] = "success"
+                elif "ea580c" in fgl or "orange" in fgl:
+                    kwargs["bootstyle"] = "warning"
+                else:
+                    kwargs["bootstyle"] = "primary"
+            kw = _BootstrapUIAdapter._text_options(self.master, kwargs, styled=True)
+            super().configure(**kw)
+
+    class CTkCheckBox(tb.Checkbutton):
+        def __init__(self, master=None, text="", variable=None, command=None, **kwargs):
+            bootstyle = kwargs.pop("bootstyle", "primary")
+            kw = _BootstrapUIAdapter._text_options(master, kwargs, styled=True, inset=25)
+            if not text:
+                kw["width"] = 0
+            super().__init__(master, text=text, variable=variable, command=command, bootstyle=bootstyle, **kw)
+            _BootstrapUIAdapter._font_style(self, kwargs.get("font"))
+
+    class CTkEntry(tb.Entry):
+        def __init__(self, master=None, placeholder_text=None, **kwargs):
+            bootstyle = kwargs.pop("bootstyle", "dark")
+            kw = _BootstrapUIAdapter._text_options(master, kwargs)
+            super().__init__(master, bootstyle=bootstyle, **kw)
+
+    class CTkComboBox(tb.Combobox):
+        def __init__(self, master=None, values=None, command=None, **kwargs):
+            kw = _BootstrapUIAdapter._text_options(master, kwargs)
+            super().__init__(master, values=values or [], **kw)
+            if command:
+                self.bind("<<ComboboxSelected>>", lambda e: command(self.get()))
+
+    class CTkOptionMenu(tb.Menubutton):
+        def __init__(self, master=None, values=None, command=None, **kwargs):
+            self.command = command
+            self.values = values or []
+            self.var = tb.StringVar(value=self.values[0] if self.values else "")
+            bootstyle = kwargs.pop("bootstyle", "secondary")
+            kw = _BootstrapUIAdapter._text_options(master, kwargs, styled=True)
+            super().__init__(master, textvariable=self.var, bootstyle=bootstyle, **kw)
+            self.menu = tb.Menu(self, tearoff=0)
+            self["menu"] = self.menu
+            self._rebuild_menu()
+
+        def _select(self, value):
+            self.set(value)
+            if self.command:
+                self.command(value)
+
+        def _rebuild_menu(self):
+            self.menu.delete(0, "end")
+            for val in self.values:
+                self.menu.add_command(label=val, command=lambda v=val: self._select(v))
+
+        def configure(self, cnf=None, **kwargs):
+            if cnf:
+                if isinstance(cnf, dict):
+                    kwargs.update(cnf)
+            if "values" in kwargs:
+                self.values = kwargs.pop("values")
+                self._rebuild_menu()
+            clean_kw = _BootstrapUIAdapter._text_options(self.master, kwargs, styled=True)
+            super().configure(**clean_kw)
+
+        def set(self, val):
+            self.var.set(val)
+
+        def get(self):
+            return self.var.get()
+
+    class CTkProgressBar(tb.Progressbar):
+        def __init__(self, master=None, **kwargs):
+            bootstyle = kwargs.pop("bootstyle", (STRIPED, SUCCESS))
+            kw = _BootstrapUIAdapter._clean_tk_kwargs(kwargs, remove_height=True)
+            super().__init__(master, bootstyle=bootstyle, maximum=100, **kw)
+
+        def set(self, val):
+            try:
+                # CTk progress bar set is 0.0 to 1.0, ttk is 0 to maximum (100)
+                num = float(val)
+                if num <= 1.0:
+                    self.configure(value=num * 100)
+                else:
+                    self.configure(value=num)
+            except Exception:
+                pass
+
+    class CTkTextbox(ScrolledText):
+        def __init__(self, master=None, **kwargs):
+            kw = _BootstrapUIAdapter._clean_tk_kwargs(kwargs)
+            super().__init__(master, autohide=True, **kw)
+
+    class CTkSegmentedButton(tb.Frame):
+        def __init__(self, master=None, values=None, command=None, **kwargs):
+            super().__init__(master)
+            self.command = command
+            self.values = values or []
+            self.buttons = {}
+            self.current_value = self.values[0] if self.values else ""
+            for val in self.values:
+                b = tb.Button(self, text=val, bootstyle="secondary-outline",
+                              command=lambda v=val: self.set(v, invoke_command=True))
+                index = len(self.buttons)
+                b.grid(row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2)
+                self.columnconfigure(index % 2, weight=1)
+                self.buttons[val] = b
+            if self.current_value:
+                self.set(self.current_value)
+
+        def set(self, val, invoke_command=False):
+            self.current_value = val
+            for k, b in self.buttons.items():
+                if k == val:
+                    b.configure(bootstyle="primary")
+                else:
+                    b.configure(bootstyle="secondary-outline")
+            if invoke_command and self.command:
+                self.command(val)
+
+        def get(self):
+            return self.current_value
+
+    class CTkFont:
+        def __new__(cls, *args, **kwargs):
+            family = kwargs.get("family", "Segoe UI")
+            size = kwargs.get("size", 10)
+            weight = kwargs.get("weight", "normal")
+            slant = kwargs.get("slant", "roman")
+            styles = []
+            if weight == "bold":
+                styles.append("bold")
+            if slant == "italic":
+                styles.append("italic")
+            style_str = " ".join(styles) if styles else "normal"
+            return (family, -size, style_str)
+
+
+ctk = _BootstrapUIAdapter()
+
+PROTECTED_PACKAGES = {"pip", "setuptools", "wheel", "ttkbootstrap", "customtkinter", "send2trash", "darkdetect", "psutil"}
 BLOCKED_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".cpp", ".c", ".h", ".cs", ".go", ".rs", ".sql", ".db", ".sqlite"}
 BLOCKED_DIRS = {"windows", "system32", "program files", "program files (x86)", "appdata\\local\\microsoft"}
 
@@ -495,7 +876,7 @@ class DevAICleanerApp(ctk.CTk):
 
         self.startup_scan_var = tk.BooleanVar(value=load_startup_scan_preference())
         self.create_layout()
-        self.log("Aplikasi siap. Layout menu sebelah kiri aktif layaknya CCleaner & WinUP.")
+        self.log("Aplikasi siap. Navigasi menu dan tampilan tabel siap digunakan.")
         self.log("Silakan klik 'SMART SCAN (ANALISIS)' untuk memulai pemindaian file sampah.")
         self.after(0, self.auto_initial_scan)
 
@@ -526,7 +907,7 @@ class DevAICleanerApp(ctk.CTk):
         # -------------------------------------------------------------
         # 1. LEFT SIDEBAR MENU (Semua Menu di Sebelah Kiri)
         # -------------------------------------------------------------
-        self.sidebar_frame = ctk.CTkFrame(self.main_container, width=280, corner_radius=0, fg_color="#18191C")
+        self.sidebar_frame = ctk.CTkFrame(self.main_container, width=256, corner_radius=0, fg_color=UI_COLORS["sidebar"])
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
         self.sidebar_frame.pack_propagate(False)
 
@@ -576,12 +957,12 @@ class DevAICleanerApp(ctk.CTk):
 
         self.nav_buttons = {}
         nav_items = [
-            ("smart_cleaner", "🧹  Smart Cleaner (CCleaner)"),
-            ("app_mover", "📦  App Mover & Restore (WinUP)"),
+            ("smart_cleaner", "🧹  Smart Cleaner"),
+            ("app_mover", "📦  App Mover & Restore"),
             ("dup_finder", "📑  Duplicate File Finder (Safe)"),
             ("py_libs", "🐍  Python Library Manager"),
             ("startup_svc", "⚡  Startup & Windows Services"),
-            ("ghost_toolbox", "🛠️  Ghost Toolbox (Tweaks & Tools)")
+            ("ghost_toolbox", "🛠️  System Toolbox (Tweaks & Tools)")
         ]
 
         for key, text in nav_items:
@@ -605,7 +986,7 @@ class DevAICleanerApp(ctk.CTk):
         sep.pack(fill="x", padx=15, pady=12)
 
         # -------------------------------------------------------------
-        # SUB-KATEGORI CHECKLIST (CCLEANER STYLE) KHUSUS SMART CLEANER
+        # SUB-KATEGORI CHECKLIST (COMPACT STYLE) KHUSUS SMART CLEANER
         # -------------------------------------------------------------
         self.subcat_container = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.subcat_container.pack(fill="both", expand=True, padx=10, pady=0)
@@ -646,11 +1027,42 @@ class DevAICleanerApp(ctk.CTk):
         self.setup_startup_svc_view()
         self.setup_ghost_toolbox_view()
 
+        # Wrap the compact action controls rather than clipping their callbacks away.
+        for view in self.views.values():
+            self._compact_toolbar(view.winfo_children()[0])
+        self._compact_toolbar(self.chk_recycle_reminder.master)
+        self._compact_toolbar(self.native_app_search.master)
+
         # Log Execution Drawer at bottom
         self.setup_log_drawer()
 
         # Default Active View
         self.switch_view("smart_cleaner")
+
+    def _compact_toolbar(self, bar):
+        """Flow existing controls into grid rows using their actual requested sizes."""
+        children = list(bar.winfo_children())
+        for child in children:
+            child.pack_forget()
+        bar.pack_propagate(True)
+        bar.grid_propagate(True)
+
+        def reflow(event=None):
+            available = max(1, event.width if event is not None else 730)
+            row = used = 0
+            for child in children:
+                if getattr(child, "_toolbar_hidden", False):
+                    child.grid_remove()
+                    continue
+                requested = child.winfo_reqwidth() + 16
+                if used and used + requested > available:
+                    row += 1
+                    used = 0
+                child.grid(row=row, column=used, columnspan=requested, sticky="w", padx=8, pady=4)
+                used += requested
+        bar.bind("<Configure>", reflow, add="+")
+        bar._reflow = reflow
+        reflow()
 
     def switch_view(self, view_key):
         for k, view in self.views.items():
@@ -751,7 +1163,7 @@ class DevAICleanerApp(ctk.CTk):
             v.set(defaults.get(k, True))
 
     # =============================================================
-    # VIEW 1: SMART CLEANER (CCLEANER & WINUP TABLE STYLE)
+    # VIEW 1: SMART CLEANER (COMPACT TABLE STYLE)
     # =============================================================
     def setup_smart_cleaner_view(self):
         parent = self.views["smart_cleaner"]
@@ -795,16 +1207,18 @@ class DevAICleanerApp(ctk.CTk):
         )
         self.chk_startup_scan.pack(side="left", padx=8, pady=10)
 
-        # Space summary indicator
+        summary_panel = ctk.CTkFrame(parent, fg_color=UI_COLORS["card"])
+        summary_panel.pack(fill="x", pady=(0, 8))
+        # Summary has its own row, never competes with action controls.
         self.lbl_smart_summary = ctk.CTkLabel(
-            action_bar,
-            text="Total Ditemukan: 0 B • Terpilih: 0 B",
+            summary_panel,
+            text="Total sampah ditemukan: 0 B (0 items)\nTerpilih untuk dibersihkan: 0 B (0 items)",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#38BDF8"
         )
-        self.lbl_smart_summary.pack(side="right", padx=15, pady=10)
+        self.lbl_smart_summary.pack(anchor="w", padx=12, pady=8)
 
-        # WinUP App Mover Fixed Table Header Bar
+        # Compact App Mover Fixed Table Header Bar
         table_header = ctk.CTkFrame(parent, height=32, corner_radius=6, fg_color="#0F172A")
         table_header.pack(fill="x", padx=0, pady=(0, 4))
         table_header.pack_propagate(False)
@@ -819,19 +1233,12 @@ class DevAICleanerApp(ctk.CTk):
             checkbox_height=18,
             command=self.toggle_all_smart_rows
         )
-        chk_master.pack(side="left", padx=(10, 5))
-
-        lbl_col_name = ctk.CTkLabel(table_header, text="Nama Item / Sub-Kategori", font=ctk.CTkFont(size=11, weight="bold"), text_color="#94A3B8")
-        lbl_col_name.pack(side="left", padx=10)
-
-        lbl_col_status = ctk.CTkLabel(table_header, text="Status", font=ctk.CTkFont(size=11, weight="bold"), text_color="#94A3B8")
-        lbl_col_status.pack(side="right", padx=(5, 15))
-
-        lbl_col_size = ctk.CTkLabel(table_header, text="Ukuran Disk", font=ctk.CTkFont(size=11, weight="bold"), text_color="#94A3B8")
-        lbl_col_size.pack(side="right", padx=25)
-
-        lbl_col_path = ctk.CTkLabel(table_header, text="Detail / Lokasi Path", font=ctk.CTkFont(size=11, weight="bold"), text_color="#94A3B8")
-        lbl_col_path.pack(side="right", padx=40)
+        chk_master.grid(row=0, column=0, padx=8)
+        self.smart_table_header = table_header
+        for column, text in enumerate(("Nama Item / Sub-Kategori", "Detail / Lokasi Path", "Ukuran Disk", "Status"), 1):
+            label = ctk.CTkLabel(table_header, text=text, font=ctk.CTkFont(size=11, weight="bold"), text_color=UI_COLORS["muted"], anchor="e" if column == 3 else "w")
+            label.grid(row=0, column=column, sticky="ew", padx=4)
+        self._smart_columns(table_header)
 
         # Scanning Progress Bar - Ditempatkan permanen dan rapi, tanpa pack/pack_forget dinamis agar tidak flickering
         self.scan_progress_frame = ctk.CTkFrame(parent, corner_radius=4, fg_color="#0F172A", height=24)
@@ -857,7 +1264,7 @@ class DevAICleanerApp(ctk.CTk):
         )
         self.lbl_scan_status.pack(side="right", padx=(0, 12), pady=2)
 
-        # Scrollable Table Body (WinUP Tabular Cards)
+        # Scrollable Table Body (Compact Tabular Cards)
         self.smart_scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         self.smart_scroll.pack(fill="both", expand=True, padx=0, pady=0)
 
@@ -1072,10 +1479,18 @@ class DevAICleanerApp(ctk.CTk):
 
         self.after(0, _on_scan_finish)
 
+    @staticmethod
+    def _smart_columns(container):
+        for column, width, weight in ((0, 36, 0), (1, 190, 1), (2, 120, 1), (3, 100, 0), (4, 104, 0)):
+            container.columnconfigure(column, minsize=width, weight=weight, uniform="flex" if weight else "")
+        container.rowconfigure(0, weight=1)
+
     def _render_smart_row(self, item):
         row = ctk.CTkFrame(self.smart_scroll, corner_radius=4, fg_color="#18191C", height=38)
         row.pack(fill="x", padx=0, pady=2)
         row.pack_propagate(False)
+        row.grid_propagate(False)
+        self._smart_columns(row)
 
         var = tk.BooleanVar(value=True if item.get("size_bytes", 0) > 0 else False)
         item["var"] = var
@@ -1090,7 +1505,7 @@ class DevAICleanerApp(ctk.CTk):
             checkbox_height=18,
             command=self.update_smart_summary
         )
-        chk.pack(side="left", padx=(10, 5))
+        chk.grid(row=0, column=0, padx=8)
 
         lbl_name = ctk.CTkLabel(
             row,
@@ -1099,7 +1514,7 @@ class DevAICleanerApp(ctk.CTk):
             anchor="w",
             width=220
         )
-        lbl_name.pack(side="left", padx=5)
+        lbl_name.grid(row=0, column=1, sticky="ew", padx=4)
 
         # Badge Status di Kanan
         lbl_badge = ctk.CTkLabel(
@@ -1112,7 +1527,7 @@ class DevAICleanerApp(ctk.CTk):
             width=85,
             height=22
         )
-        lbl_badge.pack(side="right", padx=(5, 12))
+        lbl_badge.grid(row=0, column=4, sticky="ew", padx=4)
 
         # Ukuran Disk
         sz_str = format_size(item.get("size_bytes", 0))
@@ -1124,7 +1539,7 @@ class DevAICleanerApp(ctk.CTk):
             width=90,
             anchor="e"
         )
-        lbl_size.pack(side="right", padx=15)
+        lbl_size.grid(row=0, column=3, sticky="ew", padx=4)
 
         # Path (Truncated)
         p_str = item.get("path", "")
@@ -1137,7 +1552,8 @@ class DevAICleanerApp(ctk.CTk):
             text_color="#94A3B8",
             anchor="e"
         )
-        lbl_path.pack(side="right", padx=15)
+        lbl_path.grid(row=0, column=2, sticky="ew", padx=4)
+        lbl_path.bind("<Button-1>", lambda event: messagebox.showinfo("Lokasi lengkap", item.get("path", "")))
 
     def toggle_all_smart_rows(self):
         val = self.var_smart_master.get()
@@ -1151,7 +1567,7 @@ class DevAICleanerApp(ctk.CTk):
         total_selected = sum(it.get("size_bytes", 0) for it in self.smart_findings if it.get("var") and it["var"].get())
         sel_count = sum(1 for it in self.smart_findings if it.get("var") and it["var"].get())
         self.lbl_smart_summary.configure(
-            text=f"Total: {format_size(total_found)} ({len(self.smart_findings)} items) • Terpilih: {format_size(total_selected)} ({sel_count} items)"
+            text=f"Total sampah ditemukan: {format_size(total_found)} ({len(self.smart_findings)} items)\nTerpilih untuk dibersihkan: {format_size(total_selected)} ({sel_count} items)"
         )
 
     def confirm_and_clean_smart(self):
@@ -1272,7 +1688,7 @@ class DevAICleanerApp(ctk.CTk):
         self.after(0, _update_ui_after_clean)
 
     # =============================================================
-    # VIEW 2: APP MOVER & RESTORE (WINUP TABLE STYLE)
+    # VIEW 2: APP MOVER & RESTORE (COMPACT TABLE STYLE)
     # =============================================================
     def setup_app_mover_view(self):
         parent = self.views["app_mover"]
@@ -1296,6 +1712,7 @@ class DevAICleanerApp(ctk.CTk):
         self.target_paths_map = {o[0]: o[1] for o in drive_opts} if drive_opts else {"D:\\DevApps": "D:\\DevApps"}
 
         self.cmb_target_drive = ctk.CTkComboBox(ctrl_bar, values=opt_names, width=220)
+        self.cmb_target_drive.set(opt_names[0])
         self.cmb_target_drive.pack(side="left", padx=5)
 
         btn_browse = ctk.CTkButton(ctrl_bar, text="Folder...", width=75, fg_color="#334155", command=self.browse_custom_target_root)
@@ -1314,7 +1731,7 @@ class DevAICleanerApp(ctk.CTk):
         )
         self.btn_move_apps.pack(side="right", padx=12, pady=10)
 
-        # WinUP Table Header Bar for App Mover
+        # Compact Table Header Bar for App Mover
         app_header = ctk.CTkFrame(parent, height=32, corner_radius=6, fg_color="#0F172A")
         app_header.pack(fill="x", padx=0, pady=(0, 4))
         app_header.pack_propagate(False)
@@ -1341,10 +1758,13 @@ class DevAICleanerApp(ctk.CTk):
         if "Pindahkan" in choice:
             self.restore_frame.pack_forget()
             self.move_scroll.pack(fill="both", expand=True)
-            self.btn_move_apps.pack(side="right", padx=12, pady=10)
+            self.btn_move_apps._toolbar_hidden = False
+            self.btn_move_apps.master._reflow()
         else:
             self.move_scroll.pack_forget()
-            self.btn_move_apps.pack_forget()
+            self.btn_move_apps._toolbar_hidden = True
+            self.btn_move_apps.grid_remove()
+            self.btn_move_apps.master._reflow()
             self.restore_frame.pack(fill="both", expand=True)
             self.refresh_restore_list()
 
@@ -1890,7 +2310,7 @@ class DevAICleanerApp(ctk.CTk):
         self.after(0, _finish_restore)
 
     # =============================================================
-    # VIEW 3: PYTHON LIBRARY MANAGER (WINUP TABLE STYLE)
+    # VIEW 3: PYTHON LIBRARY MANAGER (COMPACT TABLE STYLE)
     # =============================================================
     def setup_py_libs_view(self):
         parent = self.views["py_libs"]
@@ -1926,7 +2346,7 @@ class DevAICleanerApp(ctk.CTk):
         )
         self.btn_uninstall_libs.pack(side="right", padx=12, pady=10)
 
-        # WinUP Table Header Bar
+        # Compact Table Header Bar
         lib_header = ctk.CTkFrame(parent, height=32, corner_radius=6, fg_color="#0F172A")
         lib_header.pack(fill="x", padx=0, pady=(0, 4))
         lib_header.pack_propagate(False)
@@ -3021,7 +3441,7 @@ class DevAICleanerApp(ctk.CTk):
         self.after(0, _update_duplicate_state)
 
     # =============================================================
-    # VIEW: GHOST TOOLBOX (TWEAKS, REPAIRS, RUNTIMES & REPO TRACKER)
+    # VIEW: SYSTEM TOOLBOX (TWEAKS, REPAIRS, RUNTIMES & REPO TRACKER)
     # =============================================================
     def setup_ghost_toolbox_view(self):
         parent = self.views["ghost_toolbox"]
@@ -3423,11 +3843,10 @@ class DevAICleanerApp(ctk.CTk):
         # Control Bar: Search & Category Filter
         ctrl = ctk.CTkFrame(container, corner_radius=6, fg_color="#18191C", height=46)
         ctrl.pack(fill="x", padx=0, pady=(0, 6))
-        ctrl.pack_propagate(False)
 
         ctk.CTkLabel(
             ctrl,
-            text="Installer Mandiri (One-Click Download & Setup Tanpa Ketergantungan Ghost):",
+            text="Installer Mandiri (Download & Setup):",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#38BDF8"
         ).pack(side="left", padx=12, pady=10)
@@ -3452,6 +3871,7 @@ class DevAICleanerApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=lambda v: self._filter_native_apps()
         )
+        self.native_app_cat.set("Semua Kategori")
         self.native_app_cat.pack(side="left", padx=6, pady=9)
 
         # Open Downloads Folder
@@ -3575,16 +3995,18 @@ class DevAICleanerApp(ctk.CTk):
 
     def _load_native_catalog(self):
         cat_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_catalog.json")
-        if not os.path.exists(cat_file):
-            cat_file = r"D:\coding\Cleaner_Windows\app_catalog.json"
-
+        self.native_app_data = []
         if os.path.exists(cat_file):
             try:
                 with open(cat_file, "r", encoding="utf-8") as f:
-                    self.native_app_data = json.load(f)
+                    items = json.load(f)
+                if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+                    raise ValueError("Katalog harus berupa daftar objek aplikasi")
+                self.native_app_data = items
             except Exception as e:
                 self.log(f"Gagal membaca app_catalog.json: {e}")
-                self.native_app_data = []
+        else:
+            self.log("Katalog App Setup tidak tersedia; daftar aplikasi kosong.")
 
         # Pindai registry Windows untuk deteksi status & perintah uninstall
         self.installed_registry_map = self._scan_installed_registry_apps()
@@ -3861,7 +4283,6 @@ class DevAICleanerApp(ctk.CTk):
         is_portable = item.get("is_portable", False)
         local_src = item.get("local_source", "")
         local_setup = item.get("local_setup", "")
-        crack_dir = item.get("crack_dir", "")
         executable = item.get("executable", fname)
 
         # Handle Portable Application Directly
@@ -4003,54 +4424,11 @@ class DevAICleanerApp(ctk.CTk):
 
                     self.log(f"Setup {name} selesai dengan return code: {returncode}")
 
-                    # Step 3: Auto-Patch Crack jika ada crack_dir
-                    if crack_dir and os.path.exists(crack_dir):
-                        if lbl and lbl.winfo_exists():
-                            self.after(0, lambda: lbl.configure(text="Menerapkan Crack...", text_color="#A78BFA"))
-                        self.log(f"Mendeteksi folder crack untuk {name}: {crack_dir}. Memulai penimpaan crack otomatis...")
-
-                        # Hentikan proses aplikasi jika terbuka otomatis setelah instalasi
-                        app_install_dir = r"C:\Program Files\Easeware\Driver Easy"
-                        time.sleep(1.5)
-                        for p in psutil.process_iter(['name', 'exe']):
-                            try:
-                                p_name = p.info['name'] or ''
-                                p_exe = p.info['exe'] or ''
-                                if 'drivereasy' in p_name.lower() or 'easeware' in p_exe.lower():
-                                    self.log(f"Menghentikan proses background: {p_name} (PID: {p.pid})")
-                                    p.kill()
-                            except Exception:
-                                pass
-
-                        time.sleep(0.5)
-                        if not os.path.exists(app_install_dir):
-                            # Cek di Program Files (x86) sebagai fallback
-                            if os.path.exists(r"C:\Program Files (x86)\Easeware\Driver Easy"):
-                                app_install_dir = r"C:\Program Files (x86)\Easeware\Driver Easy"
-
-                        if os.path.exists(app_install_dir):
-                            replaced_files = []
-                            for crack_file in os.listdir(crack_dir):
-                                src_f = os.path.join(crack_dir, crack_file)
-                                dst_f = os.path.join(app_install_dir, crack_file)
-                                if os.path.isfile(src_f):
-                                    try:
-                                        shutil.copy2(src_f, dst_f)
-                                        replaced_files.append(crack_file)
-                                        self.log(f"SUKSES menimpa crack: {crack_file} -> {dst_f}")
-                                    except Exception as ce:
-                                        self.log(f"Gagal menimpa {crack_file}: {ce}")
-                            if replaced_files:
-                                self.log(f"Auto-Crack {name} BERHASIL diterapkan: {', '.join(replaced_files)}")
-                                messagebox.showinfo("Crack Diterapkan", f"Instalasi dan crack otomatis untuk {name} berhasil diterapkan!\nFile tertimpa: {', '.join(replaced_files)}")
-                        else:
-                            self.log(f"Peringatan: Direktori instalasi {app_install_dir} tidak ditemukan untuk patch crack.")
-
                     # Update status registry
                     self.installed_registry_map = self._scan_installed_registry_apps()
                     self.after(0, self._filter_native_apps)
 
-                    if not crack_dir and returncode == 0:
+                    if returncode == 0:
                         messagebox.showinfo("Setup Selesai", f"Aplikasi {name} berhasil dipasang di komputer!")
 
                 except Exception as e:
@@ -4255,7 +4633,7 @@ class DevAICleanerApp(ctk.CTk):
 
 
     def check_all_ghost_urls_async(self):
-        self.log("Memulai pengecekan live vs dead link untuk URL Ghost Toolbox...")
+        self.log("Memulai pengecekan live vs dead link untuk URL System Toolbox...")
         visible_urls = list(self.ghost_url_status_labels.keys())
         if not visible_urls:
             messagebox.showinfo("Info", "Tidak ada URL yang ditampilkan untuk dicek.")
@@ -4293,7 +4671,7 @@ class DevAICleanerApp(ctk.CTk):
                 if lbl and lbl.winfo_exists():
                     self.after(0, lambda l=lbl, t=st_text, c=color: l.configure(text=t, text_color=c))
 
-            self.log("Pemeriksaan status URL Ghost Toolbox selesai.")
+            self.log("Pemeriksaan status URL System Toolbox selesai.")
 
         self.executor.submit(_check_worker)
 
@@ -4314,7 +4692,7 @@ class DevAICleanerApp(ctk.CTk):
 
     def setup_log_drawer(self):
         log_frame = ctk.CTkFrame(self.content_area, corner_radius=8, fg_color="#18191C", height=100)
-        log_frame.pack(fill="x", padx=12, pady=(6, 10))
+        log_frame.pack(side="bottom", fill="x", padx=12, pady=(6, 10))
         log_frame.pack_propagate(False)
 
         top_bar = ctk.CTkFrame(log_frame, fg_color="transparent")

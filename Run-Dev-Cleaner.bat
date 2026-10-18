@@ -19,7 +19,12 @@ if %errorlevel% neq 0 (
 )
 
 echo [1/2] Memastikan dependencies terinstal...
-python -m pip install customtkinter send2trash -q
+python -m pip install ttkbootstrap psutil send2trash -q
+if errorlevel 1 (
+    echo [ERROR] Instalasi dependencies gagal. Periksa koneksi dan environment Python.
+    pause
+    exit /b 1
+)
 
 echo [2/2] Menjalankan aplikasi Dev & AI CLI Cleaner...
 start "" pythonw dev_cleaner.py

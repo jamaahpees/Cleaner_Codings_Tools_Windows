@@ -150,6 +150,15 @@ class SmartCleanerMutationTests(unittest.TestCase):
             def pack_propagate(self, *args):
                 pass
 
+            def grid(self, **kwargs):
+                pass
+
+            def columnconfigure(self, *args, **kwargs):
+                pass
+
+            def rowconfigure(self, *args, **kwargs):
+                pass
+
             def set(self, *args):
                 pass
 
