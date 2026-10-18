@@ -47,7 +47,13 @@ The source also uses Python standard-library modules including `tkinter`, `winre
 
 ## Local persistence and logging
 
-The source stores operational state under `%LOCALAPPDATA%\DevAICleaner`, including App Mover history, registry backup files, and Python package diagnostics. It may also read a legacy move-history file at `C:\ProgramData\WinUP\AppMover\moves.json`. These files are per-machine/user state and must not be added to version control.
+The source stores operational state under `%LOCALAPPDATA%\DevAICleaner`, including App Mover history (`moves.json`), user preferences (`preferences.json` for startup scan), registry backup files, and Python package diagnostics. It can read existing local records while remaining completely standalone from external WinUP installations. These files are per-machine/user state and must not be added to version control.
+
+## Process Execution & Windowing
+
+- Console subprocesses (robocopy, sc.exe, reg.exe, dism.exe, pip, python inspection) execute with `CREATE_NO_WINDOW` (`0x08000000` on Windows, `0` on non-Windows) to prevent terminal popup windows while capturing all stdout/stderr for logging.
+- Intended user-facing programs (portable app binaries, installers) preserve interactive visibility.
+- Standalone launcher `Run-Dev-Cleaner.pyw` provides a console-free launch with GUI error fallback.
 
 ## Build prerequisites and reproducibility gaps
 

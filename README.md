@@ -8,12 +8,13 @@ A Windows desktop utility built with Python and CustomTkinter for reviewing and 
 
 The current application source provides these sections:
 
-- **Smart Cleaner** — scans configured browser, temporary, developer-cache/project, and selected registry-orphan categories; presents findings before cleanup.
-- **App Mover & Restore** — identifies candidate application folders, checks safety rules, and can move eligible folders to another drive using Robocopy and NTFS directory junctions. A local move history supports restore.
-- **Python Library Manager** — discovers Python environments and lists installed packages; protects selected core packages from uninstall selection.
-- **Startup & Windows Services** — displays startup entries and Windows services for management.
-- **Duplicate File Finder** — scans a selected location and offers duplicate-file handling.
-- **Ghost Toolbox** — includes links and Windows utility/tweak actions.
+- **Smart Cleaner** — scans configured browser, temporary, developer-cache/project, and selected registry-orphan categories; presents findings before cleanup. Includes an optional startup Smart Scan (default OFF, persistent in user preferences) and removes only verified cleaned rows without automatic rescans.
+- **App Mover & Restore** — standalone directory mover and restorer within Cleaner; moves eligible application folders using Robocopy and NTFS directory junctions (`mklink /J`). Preserves durable recovery state (`restored_pending_cleanup`) and supports explicit cleanup retry without recopying.
+- **Python Library Manager** — discovers Python environments and lists installed packages; verifies removal through the selected interpreter's `importlib.metadata` and updates UI rows in-place without triggering automatic rescans.
+- **Startup & Windows Services** — displays startup entries and Windows services; updates status in-place upon verified action without full rescans.
+- **Duplicate File Finder** — scans a selected location, safely moves selected duplicates to the Recycle Bin, and updates local group state without rescanning.
+- **Ghost Toolbox** — includes links and Windows utility/tweak actions; internal console subprocesses run silently with hidden console windows (`CREATE_NO_WINDOW`).
+- **Application-wide Mutation Guard** — serializes destructive operations and prevents scans and mutations from interfering with each other.
 
 Feature details vary by Windows version, permissions, available system tools, and selected environment. This repository is an early-stage utility; inspect the source and test carefully before using operations that modify the system.
 

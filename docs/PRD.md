@@ -47,17 +47,22 @@ Windows users and developers accumulate temporary files, caches, project environ
 
 ## 6. Functional requirements
 
-### 6.1 Smart Cleaner (implemented baseline)
+### 6.1 Smart Cleaner (implemented)
 - Present user-selectable scan categories in the interface.
 - Search supported browser/temp/developer/project and registry-orphan locations based on enabled categories.
 - Display findings and associated location/size/status information.
 - Require explicit selection and confirmation before cleanup.
-- Use the Recycle Bin for supported project-folder removal and create registry backup files before registry cleanup where the implementation supports it.
+- Optional startup Smart Scan: Configurable via checkbox, default OFF, saved to `%LOCALAPPDATA%\DevAICleaner\preferences.json`, executed once upon app launch following checked categories.
+- Success-only mutation: Remove only verified cleaned items from UI state; failed/unverified items are retained and reported with diagnostic feedback. No action-triggered automatic rescans.
+- Use the Recycle Bin for supported project-folder removal and create real `reg.exe export` registry backup files before registry cleanup.
 
-### 6.2 App Mover & Restore (implemented baseline)
+### 6.2 App Mover & Restore (implemented)
+- Standalone implementation within Cleaner without external WinUP runtime dependencies.
 - Enumerate application candidates from Windows uninstall registry locations and determine candidate install folders.
 - Apply path/name safety filters and display eligibility status.
 - Allow choosing a destination outside the system drive and check available space when possible.
+- Atomic move history persistence (`moves.json`), durable recovery phases (`restored_pending_cleanup`), and explicit retry for pending target cleanups without recopying or automatic rescans.
+- Application-wide mutation guard: Prevents concurrent scans and mutations across all views.
 - Copy using Robocopy and create an NTFS directory junction for selected eligible folders.
 - Persist move history locally and offer a restore action.
 - Report copy, junction, and restore failures without presenting them as successful operations.

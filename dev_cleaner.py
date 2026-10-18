@@ -8,6 +8,7 @@ and Startup & Windows Services Manager.
 import os
 import sys
 import shutil
+import tempfile
 import time
 import json
 import re
@@ -47,9 +48,32 @@ BLOCKED_APP_PATTERNS = [
 
 MOVES_HISTORY_DIR = os.path.join(os.getenv("LOCALAPPDATA", "C:\\"), "DevAICleaner")
 MOVES_HISTORY_FILE = os.path.join(MOVES_HISTORY_DIR, "moves.json")
-WINUP_MOVES_FILE = r"C:\ProgramData\WinUP\AppMover\moves.json"
 REG_BACKUP_DIR = os.path.join(MOVES_HISTORY_DIR, "RegistryBackups")
 PY_LIBS_DEBUG_LOG = os.path.join(MOVES_HISTORY_DIR, "py_libs_debug.log")
+STARTUP_SCAN_PREFERENCE_FILE = os.path.join(MOVES_HISTORY_DIR, "preferences.json")
+
+
+def hidden_console_creation_flags():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def load_startup_scan_preference(path=STARTUP_SCAN_PREFERENCE_FILE):
+    try:
+        with open(path, "r", encoding="utf-8") as prefs:
+            value = json.load(prefs).get("startup_smart_scan", False)
+        return value is True
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def save_startup_scan_preference(path, enabled):
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as prefs:
+            json.dump({"startup_smart_scan": bool(enabled)}, prefs)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def log_py_debug(msg):
@@ -129,6 +153,68 @@ def is_junction(path_str):
         return False
 
 
+def directory_manifest(path):
+    """Hash regular files without following reparse points; fail closed on unreadable data."""
+    if not os.path.isdir(path) or os.path.islink(path) or is_junction(path):
+        raise OSError(f"Folder verifikasi tidak valid atau berupa reparse point: {path}")
+    manifest = {}
+    def walk_error(error):
+        raise error
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=walk_error):
+        for name in dirs + files:
+            full_path = os.path.join(root, name)
+            if os.path.islink(full_path) or is_junction(full_path):
+                raise OSError(f"Reparse point tidak didukung untuk verifikasi: {full_path}")
+        for name in dirs:
+            manifest[os.path.relpath(os.path.join(root, name), path)] = None
+        for name in files:
+            full_path = os.path.join(root, name)
+            digest = hashlib.sha256()
+            with open(full_path, "rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            manifest[os.path.relpath(full_path, path)] = digest.hexdigest()
+    return manifest
+
+
+def cleanup_verified_copy(original, target, manifest):
+    """Remove only unchanged remnants of a recorded copy after verifying its survivor."""
+    original_real = os.path.normcase(os.path.realpath(original))
+    target_real = os.path.normcase(os.path.realpath(target))
+    try:
+        common = os.path.commonpath([original_real, target_real])
+    except ValueError:
+        common = None
+    if common in (original_real, target_real):
+        raise OSError("Lokasi salinan pemulihan tidak boleh sama atau bersarang.")
+    if not isinstance(manifest, dict) or directory_manifest(original) != manifest:
+        raise OSError("Folder hasil pemulihan berubah; pembersihan otomatis dibatalkan.")
+    if not os.path.lexists(target):
+        return
+    remaining = directory_manifest(target)
+    if any(name not in manifest or manifest[name] != digest
+           for name, digest in remaining.items()):
+        raise OSError("Salinan target berubah; data dipertahankan untuk pemeriksaan manual.")
+    # Validate everything before deletion, then recheck each entry as it is removed.
+    for name, digest in sorted(remaining.items(), key=lambda pair: pair[0].count(os.sep), reverse=True):
+        path = os.path.join(target, name)
+        if os.path.islink(path) or is_junction(path):
+            raise OSError(f"Lokasi pembersihan berubah: {path}")
+        if digest is None:
+            os.rmdir(path)
+        else:
+            if directory_manifest(original) != manifest:
+                raise OSError("Folder hasil pemulihan berubah selama pembersihan.")
+            with open(path, "rb") as file:
+                actual = hashlib.sha256()
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    actual.update(chunk)
+            if actual.hexdigest() != digest:
+                raise OSError(f"File target berubah: {path}")
+            os.remove(path)
+    os.rmdir(target)
+
+
 def get_directory_size_bytes(path):
     total = 0
     try:
@@ -157,62 +243,44 @@ def format_size(bytes_val):
 
 
 def load_moves_history():
+    try:
+        with open(MOVES_HISTORY_FILE, "r", encoding="utf-8-sig") as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        return []
+    if not isinstance(data, list):
+        raise ValueError("Riwayat pemindahan harus berupa daftar; file tidak diubah.")
     records = []
-    seen_origins = set()
-
-    # 1. Load dari file DevAICleaner lokal
-    if os.path.exists(MOVES_HISTORY_FILE):
-        try:
-            with open(MOVES_HISTORY_FILE, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    for item in data:
-                        orig = item.get("original_path") or item.get("Original")
-                        if orig:
-                            norm_orig = os.path.normpath(orig).lower()
-                            seen_origins.add(norm_orig)
-                            records.append({
-                                "name": item.get("name") or item.get("Name", "Aplikasi"),
-                                "original_path": orig,
-                                "target_path": item.get("target_path") or item.get("Destination", ""),
-                                "size_bytes": item.get("size_bytes", 0),
-                                "date": item.get("date") or item.get("Date", "")
-                            })
-        except Exception:
-            pass
-
-    # 2. Gabungkan dengan catatan WinUP jika ada (C:\ProgramData\WinUP\AppMover\moves.json)
-    if os.path.exists(WINUP_MOVES_FILE):
-        try:
-            with open(WINUP_MOVES_FILE, "r", encoding="utf-8-sig") as f:
-                winup_data = json.load(f)
-                if isinstance(winup_data, list):
-                    for w_item in winup_data:
-                        orig = w_item.get("Original") or w_item.get("original_path")
-                        if orig:
-                            norm_orig = os.path.normpath(orig).lower()
-                            if norm_orig not in seen_origins:
-                                seen_origins.add(norm_orig)
-                                records.append({
-                                    "name": w_item.get("Name") or w_item.get("name", "Aplikasi"),
-                                    "original_path": orig,
-                                    "target_path": w_item.get("Destination") or w_item.get("target_path", ""),
-                                    "size_bytes": w_item.get("size_bytes", 0),
-                                    "date": w_item.get("Date") or w_item.get("date", "")
-                                })
-        except Exception:
-            pass
-
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("Entri riwayat pemindahan tidak valid; file tidak diubah.")
+        orig = item.get("original_path") or item.get("Original")
+        target = item.get("target_path") or item.get("Destination")
+        if not isinstance(orig, str) or not orig or not isinstance(target, str) or not target:
+            raise ValueError("Lokasi riwayat pemindahan tidak valid; file tidak diubah.")
+        record = dict(item)
+        record.update({"name": item.get("name") or item.get("Name", "Aplikasi"),
+                       "original_path": orig, "target_path": target,
+                       "size_bytes": item.get("size_bytes", 0),
+                       "date": item.get("date") or item.get("Date", "")})
+        records.append(record)
     return records
 
 
 def save_moves_history(records):
     os.makedirs(MOVES_HISTORY_DIR, exist_ok=True)
+    temporary_path = None
     try:
-        with open(MOVES_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error saving moves history: {e}")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=MOVES_HISTORY_DIR,
+                                         prefix="moves-", suffix=".tmp", delete=False) as file:
+            temporary_path = file.name
+            json.dump(records, file, indent=2, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, MOVES_HISTORY_FILE)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def get_target_drive_options():
@@ -258,24 +326,45 @@ def stop_processes_in_folder(folder_path):
 # REGISTRY CLEANER & BACKUP HELPERS
 # ==========================================
 def create_registry_backup(keys_data, log_callback=None):
-    os.makedirs(REG_BACKUP_DIR, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(REG_BACKUP_DIR, f"Registry_Backup_{ts}.reg")
+    backup_file = None
     try:
-        with open(backup_file, "w", encoding="utf-16") as f:
-            f.write("Windows Registry Editor Version 5.00\r\n\r\n")
-            for item in keys_data:
+        if not keys_data:
+            return None
+        os.makedirs(REG_BACKUP_DIR, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="registry-export-", dir=REG_BACKUP_DIR) as staging:
+            exports = []
+            for index, item in enumerate(keys_data):
                 root_str = item.get("root_str", "")
                 sub_path = item.get("sub_path", "")
-                if root_str and sub_path:
-                    f.write(f"; Backup item: {item.get('name', 'Entry')}\r\n")
-                    f.write(f"[{root_str}\\{sub_path}]\r\n\r\n")
+                if root_str not in ("HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER") or not sub_path:
+                    raise ValueError("Lokasi registry backup tidak valid.")
+                key_path = f"{root_str}\\{sub_path}"
+                export_path = os.path.join(staging, f"{index}.reg")
+                result = subprocess.run(["reg.exe", "export", key_path, export_path, "/y"],
+                                        capture_output=True, text=True,
+                                        creationflags=hidden_console_creation_flags())
+                if result.returncode != 0:
+                    raise OSError(result.stderr.strip() or result.stdout.strip() or "Ekspor registry gagal.")
+                with open(export_path, encoding="utf-16") as exported:
+                    text = exported.read()
+                header = "Windows Registry Editor Version 5.00"
+                if not text.startswith(header) or f"[{key_path}]" not in text:
+                    raise OSError("Hasil ekspor registry tidak valid.")
+                exports.append(text[len(header):].lstrip("\r\n"))
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-16", dir=REG_BACKUP_DIR,
+                                             prefix="Registry_Backup_", suffix=".reg", delete=False) as backup:
+                backup_file = backup.name
+                backup.write(header + "\n\n" + "\n".join(exports))
+                backup.flush()
+                os.fsync(backup.fileno())
         if log_callback:
             log_callback(f"Backup registry dibuat: {backup_file}")
         return backup_file
-    except Exception as e:
+    except Exception as error:
+        if backup_file and os.path.exists(backup_file):
+            os.remove(backup_file)
         if log_callback:
-            log_callback(f"Gagal membuat backup registry: {e}")
+            log_callback(f"Gagal membuat backup registry: {error}")
         return None
 
 
@@ -361,6 +450,14 @@ def scan_registry_orphans():
 # MAIN APPLICATION CLASS
 # ==========================================
 class DevAICleanerApp(ctk.CTk):
+    active_mutation = None
+    is_scanning_smart = False
+    is_scanning_apps = False
+    is_scanning_libs = False
+    is_scanning_dup = False
+    is_scanning_startup = False
+    is_scanning_services = False
+
     def __init__(self):
         super().__init__()
         self.title("Dev & AI CLI Cleaner - All-In-One Modern Suite")
@@ -394,10 +491,32 @@ class DevAICleanerApp(ctk.CTk):
         self.is_scanning_dup = False
         self.is_scanning_startup = False
         self.is_scanning_services = False
+        self.active_mutation = None
 
+        self.startup_scan_var = tk.BooleanVar(value=load_startup_scan_preference())
         self.create_layout()
         self.log("Aplikasi siap. Layout menu sebelah kiri aktif layaknya CCleaner & WinUP.")
         self.log("Silakan klik 'SMART SCAN (ANALISIS)' untuk memulai pemindaian file sampah.")
+        self.after(0, self.auto_initial_scan)
+
+    def acquire_mutation_guard(self, operation_name):
+        if self.active_mutation is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; permintaan '{operation_name}' dibatalkan.")
+            return False
+        # Check if any scan is active
+        if (getattr(self, "is_scanning_smart", False) or
+            getattr(self, "is_scanning_apps", False) or
+            getattr(self, "is_scanning_libs", False) or
+            getattr(self, "is_scanning_dup", False) or
+            getattr(self, "is_scanning_startup", False) or
+            getattr(self, "is_scanning_services", False)):
+            self.log(f"Pemindaian sedang berjalan; operasi '{operation_name}' tidak dapat dijalankan.")
+            return False
+        self.active_mutation = operation_name
+        return True
+
+    def release_mutation_guard(self):
+        self.active_mutation = None
 
     def create_layout(self):
         # Master Container: Left Sidebar Menu + Right Content Canvas
@@ -665,6 +784,17 @@ class DevAICleanerApp(ctk.CTk):
         )
         self.btn_clean_smart.pack(side="left", padx=6, pady=10)
 
+        if not hasattr(self, "startup_scan_var"):
+            self.startup_scan_var = tk.BooleanVar(value=load_startup_scan_preference())
+        self.chk_startup_scan = ctk.CTkCheckBox(
+            action_bar,
+            text="Pindai otomatis saat dibuka",
+            variable=self.startup_scan_var,
+            command=self._save_startup_scan_preference,
+            font=ctk.CTkFont(size=11)
+        )
+        self.chk_startup_scan.pack(side="left", padx=8, pady=10)
+
         # Space summary indicator
         self.lbl_smart_summary = ctk.CTkLabel(
             action_bar,
@@ -769,6 +899,9 @@ class DevAICleanerApp(ctk.CTk):
         ).pack(pady=(12, 22))
 
     def start_smart_scan_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian Smart Scan ditunda.")
+            return
         if getattr(self, "is_scanning_smart", False):
             self.log("Peringatan: Smart Scan sedang berjalan. Mohon tunggu proses selesai.")
             return
@@ -789,7 +922,8 @@ class DevAICleanerApp(ctk.CTk):
         self._scan_anim_step = 0
         self._animate_scan_processing()
 
-        self.executor.submit(self._bg_smart_scan)
+        categories = {key: bool(variable.get()) for key, variable in self.subcat_vars.items()}
+        self.executor.submit(self._bg_smart_scan, categories)
 
     def _animate_scan_processing(self):
         if not getattr(self, "is_scanning_smart", False):
@@ -809,14 +943,14 @@ class DevAICleanerApp(ctk.CTk):
         self._scan_anim_step += 1
         self.after(300, self._animate_scan_processing)
 
-    def _bg_smart_scan(self):
+    def _bg_smart_scan(self, categories):
         findings = []
         user_home = str(Path.home())
         local_app = os.getenv("LOCALAPPDATA", "")
         app_data = os.getenv("APPDATA", "")
 
         # 1. Browser & Windows
-        if self.subcat_vars.get("chrome_cache", tk.BooleanVar()).get():
+        if categories.get("chrome_cache", False):
             c_path = os.path.join(local_app, r"Google\Chrome\User Data\Default\Cache")
             gpu_path = os.path.join(local_app, r"Google\Chrome\User Data\Default\GPUCache")
             for p in [c_path, gpu_path]:
@@ -824,32 +958,32 @@ class DevAICleanerApp(ctk.CTk):
                     sz = get_directory_size_bytes(p)
                     findings.append({"name": "Google Chrome Cache", "path": p, "detail": "Browser Cache & GPU Data", "size_bytes": sz, "badge": "[CACHE]", "badge_color": "#0284C7", "type": "folder"})
 
-        if self.subcat_vars.get("edge_cache", tk.BooleanVar()).get():
+        if categories.get("edge_cache", False):
             e_path = os.path.join(local_app, r"Microsoft\Edge\User Data\Default\Cache")
             if os.path.exists(e_path):
                 sz = get_directory_size_bytes(e_path)
                 findings.append({"name": "Microsoft Edge Cache", "path": e_path, "detail": "Edge Browser Cache", "size_bytes": sz, "badge": "[CACHE]", "badge_color": "#0284C7", "type": "folder"})
 
-        if self.subcat_vars.get("win_user_temp", tk.BooleanVar()).get():
+        if categories.get("win_user_temp", False):
             temp_p = os.getenv("TEMP", "")
             if os.path.exists(temp_p):
                 sz = get_directory_size_bytes(temp_p)
                 findings.append({"name": "Windows User Temp (%TEMP%)", "path": temp_p, "detail": "Temporary User Files", "size_bytes": sz, "badge": "[AMAN]", "badge_color": "#16A34A", "type": "folder_contents"})
 
-        if self.subcat_vars.get("win_sys_temp", tk.BooleanVar()).get():
+        if categories.get("win_sys_temp", False):
             sys_temp = r"C:\Windows\Temp"
             if os.path.exists(sys_temp):
                 sz = get_directory_size_bytes(sys_temp)
                 findings.append({"name": "Windows System Temp", "path": sys_temp, "detail": "System Temporary Files", "size_bytes": sz, "badge": "[AMAN]", "badge_color": "#16A34A", "type": "folder_contents"})
 
-        if self.subcat_vars.get("win_thumbs", tk.BooleanVar()).get():
+        if categories.get("win_thumbs", False):
             exp_p = os.path.join(local_app, r"Microsoft\Windows\Explorer")
             if os.path.exists(exp_p):
                 sz = sum(f.stat().st_size for f in Path(exp_p).glob("thumbcache_*.db") if f.is_file())
                 if sz > 0:
                     findings.append({"name": "Thumbnail Cache (Thumbcache)", "path": exp_p, "detail": "Windows Explorer Previews", "size_bytes": sz, "badge": "[AMAN]", "badge_color": "#16A34A", "type": "thumbcache"})
 
-        if self.subcat_vars.get("win_dumps", tk.BooleanVar()).get():
+        if categories.get("win_dumps", False):
             cd_p = os.path.join(local_app, "CrashDumps")
             if os.path.exists(cd_p):
                 sz = get_directory_size_bytes(cd_p)
@@ -865,20 +999,20 @@ class DevAICleanerApp(ctk.CTk):
         ]
 
         for flag, title, paths, desc, badge, bcolor in dev_targets:
-            if self.subcat_vars.get(flag, tk.BooleanVar()).get():
+            if categories.get(flag, False):
                 for p in paths:
                     if os.path.exists(p):
                         sz = get_directory_size_bytes(p)
                         findings.append({"name": title, "path": p, "detail": desc, "size_bytes": sz, "badge": badge, "badge_color": bcolor, "type": "folder"})
 
         # 3. Proyek & Dependencies (.venv, node_modules)
-        if any(self.subcat_vars.get(k, tk.BooleanVar()).get() for k in ["proj_envs", "proj_modules", "proj_bytecode"]):
+        if any(categories.get(k, False) for k in ["proj_envs", "proj_modules", "proj_bytecode"]):
             target_patterns = []
-            if self.subcat_vars.get("proj_envs", tk.BooleanVar()).get():
+            if categories.get("proj_envs", False):
                 target_patterns.extend(["venv", ".venv", "env"])
-            if self.subcat_vars.get("proj_modules", tk.BooleanVar()).get():
+            if categories.get("proj_modules", False):
                 target_patterns.append("node_modules")
-            if self.subcat_vars.get("proj_bytecode", tk.BooleanVar()).get():
+            if categories.get("proj_bytecode", False):
                 target_patterns.extend(["__pycache__", ".pytest_cache"])
 
             # Lewati direktori sistem Windows/Appdata yang rawan hang saat traverse
@@ -905,9 +1039,11 @@ class DevAICleanerApp(ctk.CTk):
                             dirs.remove(d)
 
         # 4. Registry Cleaner
-        if self.subcat_vars.get("reg_orphans", tk.BooleanVar()).get() or self.subcat_vars.get("reg_app_paths", tk.BooleanVar()).get():
+        if categories.get("reg_orphans", False) or categories.get("reg_app_paths", False):
             reg_items = scan_registry_orphans()
-            findings.extend(reg_items)
+            findings.extend(item for item in reg_items
+                            if (item.get("type") == "reg_uninstall" and categories.get("reg_orphans", False))
+                            or (item.get("type") == "reg_app_path" and categories.get("reg_app_paths", False)))
 
         self.smart_findings = findings
 
@@ -1019,8 +1155,11 @@ class DevAICleanerApp(ctk.CTk):
         )
 
     def confirm_and_clean_smart(self):
+        if not self.acquire_mutation_guard("smart_clean"):
+            return
         selected = [it for it in self.smart_findings if it.get("var") and it["var"].get()]
         if not selected:
+            self.release_mutation_guard()
             messagebox.showinfo("Informasi", "Pilih minimal satu item untuk dibersihkan.")
             return
 
@@ -1031,113 +1170,104 @@ class DevAICleanerApp(ctk.CTk):
               f"• Entri registry akan di-backup otomatis (.reg) sebelum dihapus.\n\n" \
               f"Lanjutkan pembersihan?"
         if not messagebox.askyesno("Konfirmasi Pembersihan Smart", msg):
+            self.release_mutation_guard()
             return
 
         self.btn_clean_smart.configure(state="disabled", text="Membersihkan...")
-        self.executor.submit(self._bg_clean_smart, selected)
+        try:
+            self.executor.submit(self._bg_clean_smart, selected)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.btn_clean_smart.configure(state="normal", text="🧹  JALANKAN PEMBERSIHAN")
+            self.log(f"Gagal menjalankan thread pembersihan: {e}")
 
     def _bg_clean_smart(self, items):
         freed = 0
         cleaned_count = 0
+        successful_items = []
         reg_items_to_backup = [it for it in items if "reg" in it.get("type", "")]
-
-        if reg_items_to_backup:
-            backup_path = create_registry_backup(reg_items_to_backup, self.log)
+        backup_path = create_registry_backup(reg_items_to_backup, self.log) if reg_items_to_backup else None
+        if reg_items_to_backup and not backup_path:
+            self.log("Gagal membuat backup registry; entri registry terpilih dipertahankan.")
 
         for it in items:
             itype = it.get("type", "")
             ipath = it.get("path", "")
             isz = it.get("size_bytes", 0)
+            item_succeeded = False
 
             try:
                 if itype == "thumbcache":
                     if os.path.exists(ipath):
-                        for f in Path(ipath).glob("thumbcache_*.db"):
-                            try:
-                                if f.is_file():
-                                    os.remove(str(f))
-                            except Exception:
-                                pass
-                        freed += isz
-                        cleaned_count += 1
-                        self.log(f"Thumbcache dibersihkan: {it['name']}")
+                        files = list(Path(ipath).glob("thumbcache_*.db"))
+                        for file_path in files:
+                            if file_path.is_file():
+                                os.remove(str(file_path))
+                        item_succeeded = all(not file_path.exists() for file_path in files)
 
-                elif itype == "folder":
+                elif itype in ("folder", "folder_contents"):
                     if os.path.exists(ipath):
                         for entry in os.scandir(ipath):
-                            try:
-                                if entry.is_file(follow_symlinks=False):
-                                    os.remove(entry.path)
-                                elif entry.is_dir(follow_symlinks=False):
-                                    shutil.rmtree(entry.path, ignore_errors=True)
-                            except Exception:
-                                pass
-                        freed += isz
-                        cleaned_count += 1
-                        self.log(f"Cache dibersihkan: {it['name']}")
-
-                elif itype == "folder_contents":
-                    if os.path.exists(ipath):
-                        for entry in os.scandir(ipath):
-                            try:
-                                if entry.is_file(follow_symlinks=False):
-                                    os.remove(entry.path)
-                                elif entry.is_dir(follow_symlinks=False):
-                                    shutil.rmtree(entry.path, ignore_errors=True)
-                            except Exception:
-                                pass
-                        freed += isz
-                        cleaned_count += 1
-                        self.log(f"Temp folder dibersihkan: {it['name']}")
+                            if entry.is_file(follow_symlinks=False):
+                                os.remove(entry.path)
+                            elif entry.is_dir(follow_symlinks=False):
+                                shutil.rmtree(entry.path)
+                        item_succeeded = not any(os.scandir(ipath))
 
                 elif itype == "project_env":
                     if os.path.exists(ipath):
                         send2trash(ipath)
-                        freed += isz
-                        cleaned_count += 1
-                        self.log(f"Proyek dikirim ke Recycle Bin: {ipath}")
+                        item_succeeded = not os.path.exists(ipath)
 
-                elif "reg" in itype:
+                elif "reg" in itype and backup_path:
                     root_h = it.get("root")
                     sub_p = it.get("sub_path")
                     if root_h and sub_p:
+                        parent_p, key_to_del = sub_p.rsplit("\\", 1)
+                        with winreg.OpenKey(root_h, parent_p, 0, winreg.KEY_WRITE) as parent:
+                            winreg.DeleteKey(parent, key_to_del)
                         try:
-                            # Hapus registry key
-                            parent_p, key_to_del = sub_p.rsplit("\\", 1)
-                            pk = winreg.OpenKey(root_h, parent_p, 0, winreg.KEY_ALL_ACCESS)
-                            winreg.DeleteKey(pk, key_to_del)
-                            cleaned_count += 1
-                            self.log(f"Registry diperbaiki: {it['name']}")
-                        except Exception as re:
-                            self.log(f"Gagal hapus registry {it['name']}: {re}")
+                            with winreg.OpenKey(root_h, sub_p, 0, winreg.KEY_READ):
+                                pass
+                        except FileNotFoundError:
+                            item_succeeded = True
 
+                if item_succeeded:
+                    successful_items.append(it)
+                    freed += isz
+                    cleaned_count += 1
+                    self.log(f"Berhasil dibersihkan: {it.get('name', ipath)}")
+                else:
+                    self.log(f"Item dipertahankan karena gagal/tidak terverifikasi: {it.get('name', ipath)}")
             except Exception as e:
                 self.log(f"Peringatan saat membersihkan {it.get('name')}: {e}")
 
         self.log(f"Pembersihan selesai! {cleaned_count} item dibersihkan. Ruang dibebaskan: ~{format_size(freed)}")
 
         def _update_ui_after_clean():
-            self.btn_clean_smart.configure(state="normal", text="🧹  JALANKAN PEMBERSIHAN")
-            # Hapus baris widget item yang telah dibersihkan tanpa perlu memicu rescan ulang
-            cleaned_set = set(id(it) for it in items)
-            remaining_findings = []
-            for it in self.smart_findings:
-                if id(it) in cleaned_set:
-                    w = it.get("row_widget")
-                    if w and w.winfo_exists():
-                        w.destroy()
-                else:
-                    remaining_findings.append(it)
-            self.smart_findings = remaining_findings
-            self.update_smart_summary()
-            if not self.smart_findings:
-                lbl_empty = ctk.CTkLabel(
-                    self.smart_scroll,
-                    text="Semua item terpilih telah dibersihkan. Sistem Anda bersih!",
-                    font=ctk.CTkFont(size=13),
-                    text_color="#4ADE80"
-                )
-                lbl_empty.pack(pady=40)
+            try:
+                self.btn_clean_smart.configure(state="normal", text="🧹  JALANKAN PEMBERSIHAN")
+                cleaned_set = {id(it) for it in successful_items}
+                remaining_findings = []
+                for it in self.smart_findings:
+                    if id(it) in cleaned_set:
+                        w = it.get("row_widget")
+                        if w and w.winfo_exists():
+                            w.destroy()
+                    else:
+                        remaining_findings.append(it)
+                self.smart_findings = remaining_findings
+                self.update_smart_summary()
+                if not self.smart_findings:
+                    lbl_empty = ctk.CTkLabel(
+                        self.smart_scroll,
+                        text="Semua item terpilih telah dibersihkan. Sistem Anda bersih!",
+                        font=ctk.CTkFont(size=13),
+                        text_color="#4ADE80"
+                    )
+                    lbl_empty.pack(pady=40)
+            finally:
+                self.release_mutation_guard()
 
         self.after(0, _update_ui_after_clean)
 
@@ -1246,6 +1376,9 @@ class DevAICleanerApp(ctk.CTk):
         return True, "AMAN / SIAP DIPINDAH"
 
     def scan_installed_apps_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian aplikasi ditunda.")
+            return
         if getattr(self, "is_scanning_apps", False):
             self.log("Peringatan: Pemindaian aplikasi sedang berjalan. Mohon tunggu...")
             return
@@ -1399,7 +1532,10 @@ class DevAICleanerApp(ctk.CTk):
                 it["var"].set(val)
 
     def confirm_and_move_selected(self):
+        if not self.acquire_mutation_guard("app_move"):
+            return
         if not is_user_admin():
+            self.release_mutation_guard()
             messagebox.showerror(
                 "Memerlukan Akses Administrator",
                 "Memindahkan aplikasi dari folder sistem C:\\Program Files dan membuat NTFS Directory Junction (mklink /J) "
@@ -1410,6 +1546,7 @@ class DevAICleanerApp(ctk.CTk):
 
         selected = [it for it in self.app_items if it.get("var") and it["var"].get() and it.get("is_safe")]
         if not selected:
+            self.release_mutation_guard()
             messagebox.showinfo("Informasi", "Pilih minimal satu aplikasi aman untuk dipindahkan.")
             return
 
@@ -1421,6 +1558,7 @@ class DevAICleanerApp(ctk.CTk):
             drive_letter = os.path.splitdrive(target_root)[0]
             usage = psutil.disk_usage(drive_letter + "\\")
             if usage.free < (total_sz + 1024 * 1024 * 1024):  # buffer 1 GB
+                self.release_mutation_guard()
                 messagebox.showerror("Error Ruang Disk", f"Ruang disk di {drive_letter} tidak mencukupi!\nDibutuhkan: {format_size(total_sz + 1024*1024*1024)}\nTersedia: {format_size(usage.free)}")
                 return
         except Exception:
@@ -1432,95 +1570,112 @@ class DevAICleanerApp(ctk.CTk):
               f"• Aplikasi tidak akan crash dan shortcut tetap bekerja normal.\n\n" \
               f"Lanjutkan pemindahan?"
         if not messagebox.askyesno("Konfirmasi Pindah Aplikasi", msg):
+            self.release_mutation_guard()
             return
 
         self.btn_move_apps.configure(state="disabled", text="Memindahkan...")
-        self.executor.submit(self._bg_move_apps, selected, target_root)
+        try:
+            self.executor.submit(self._bg_move_apps, selected, target_root)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.btn_move_apps.configure(state="normal", text="Pindahkan Terpilih (Junction)")
+            self.log(f"Gagal menjalankan thread pemindahan aplikasi: {e}")
 
     def _bg_move_apps(self, items, target_root):
-        os.makedirs(target_root, exist_ok=True)
-        history = load_moves_history()
         moved_success = []
-
-        for it in items:
-            src = it["path"]
-            app_folder_name = os.path.basename(src)
-            dest = os.path.join(target_root, app_folder_name)
-            backup_path = src + f".mover-bak-{int(time.time())}"
-
-            self.log(f"Memulai pemindahan: {it['name']} -> {dest}")
-            stopped = stop_processes_in_folder(src)
-            if stopped:
-                self.log(f"Menghentikan proses aktif: {', '.join(stopped)}")
-
-            # Robocopy (/XJ: Jangan ikuti junction agar tidak rekursif)
-            cmd = ["robocopy", src, dest, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:3", "/W:1", "/NP", "/NFL", "/NDL", "/XJ"]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode >= 8:
-                err_msg = f"Robocopy gagal menyalin {it['name']} (Exit code {res.returncode}). Operasi dibatalkan."
-                self.log(f"ERROR: {err_msg}")
-                self.after(0, lambda m=err_msg: messagebox.showerror("Gagal Menyalin File", m))
-                shutil.rmtree(dest, ignore_errors=True)
-                continue
-
-            try:
-                os.rename(src, backup_path)
-            except Exception as e:
-                err_msg = f"Gagal me-rename folder asal '{src}' ({e}). Folder mungkin sedang dikunci proses lain."
-                self.log(f"ERROR: {err_msg}")
-                self.after(0, lambda m=err_msg: messagebox.showerror("Gagal Akses Folder", m))
-                shutil.rmtree(dest, ignore_errors=True)
-                continue
-
-            mklink_cmd = ["cmd", "/c", "mklink", "/J", src, dest]
-            mk_res = subprocess.run(mklink_cmd, capture_output=True, text=True)
-            if mk_res.returncode != 0:
-                err_msg = f"Gagal membuat NTFS Junction link ({mk_res.stderr.strip() or mk_res.stdout.strip()}). Melakukan rollback..."
-                self.log(f"ERROR: {err_msg}")
-                self.after(0, lambda m=err_msg: messagebox.showerror("Gagal Membuat Junction", m))
-                os.rename(backup_path, src)
-                shutil.rmtree(dest, ignore_errors=True)
-                continue
-
-            # Sukses
-            shutil.rmtree(backup_path, ignore_errors=True)
-            self.log(f"SUKSES: {it['name']} berhasil dipindahkan dan Junction aktif!")
-            moved_success.append(it)
-
-            record = {
-                "name": it["name"],
-                "original_path": src,
-                "target_path": dest,
-                "size_bytes": it["size_bytes"],
-                "date": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            history = [h for h in history if h.get("original_path") != src]
-            history.append(record)
-
-            # Langsung hancurkan widget baris dari UI secara instan agar tidak lagi muncul di tab pindah
-            def _remove_row_ui(item_ref=it):
-                rw = item_ref.get("row_widget")
-                if rw and rw.winfo_exists():
-                    rw.destroy()
-            self.after(0, _remove_row_ui)
-
-        save_moves_history(history)
-
-        # Hapus item yang sukses dipindahkan dari self.app_items
-        success_paths = set(it["path"] for it in moved_success)
-        self.app_items = [it for it in self.app_items if it.get("path") not in success_paths]
-
-        def _finish_move():
-            self.btn_move_apps.configure(state="normal", text="Pindahkan Terpilih (Junction)")
-            self.refresh_restore_list()
-            if moved_success:
-                messagebox.showinfo(
-                    "Pemindahan Berhasil",
-                    f"Sebanyak {len(moved_success)} aplikasi telah sukses dipindahkan ke {target_root}.\n"
-                    f"Folder C: kini digantikan oleh NTFS Directory Junction dan aplikasi dapat dikembalikan sewaktu-waktu di tab Restore."
-                )
-
-        self.after(0, _finish_move)
+        try:
+            os.makedirs(target_root, exist_ok=True)
+            for item in items:
+                src = item["path"]
+                dest = os.path.join(target_root, os.path.basename(os.path.normpath(src)))
+                stage = None
+                backup_container = None
+                backup = None
+                committed = False
+                try:
+                    if not os.path.isdir(src) or is_junction(src) or os.path.islink(src):
+                        raise OSError("Folder asal tidak valid atau sudah berupa junction.")
+                    if os.path.lexists(dest):
+                        raise OSError(f"Tujuan sudah ada; tidak ditimpa: {dest}")
+                    try:
+                        common = os.path.commonpath([os.path.realpath(src), os.path.realpath(target_root)])
+                    except ValueError:
+                        common = None
+                    if common in (os.path.realpath(src), os.path.realpath(dest)):
+                        raise OSError("Folder tujuan tidak boleh bersarang dengan asal.")
+                    stop_processes_in_folder(src)
+                    before = directory_manifest(src)
+                    stage = tempfile.mkdtemp(prefix=".mover-copy-", dir=target_root)
+                    result = subprocess.run(
+                        ["robocopy", src, stage, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:3", "/W:1", "/NP", "/NFL", "/NDL", "/XJ"],
+                        capture_output=True, text=True, timeout=3600,
+                        creationflags=hidden_console_creation_flags())
+                    if not 0 <= result.returncode < 8:
+                        raise OSError(f"Robocopy gagal ({result.returncode}): {result.stderr or result.stdout}")
+                    if directory_manifest(stage) != before or directory_manifest(src) != before:
+                        raise OSError("Isi salinan tidak cocok atau folder asal berubah.")
+                    os.rename(stage, dest)
+                    stage = None
+                    backup_container = tempfile.mkdtemp(prefix=".mover-backup-", dir=os.path.dirname(src))
+                    backup = os.path.join(backup_container, "original")
+                    os.rename(src, backup)
+                    result = subprocess.run(["cmd", "/c", "mklink", "/J", src, dest],
+                                            capture_output=True, text=True,
+                                            creationflags=hidden_console_creation_flags())
+                    if result.returncode != 0 or not is_junction(src) or not os.path.samefile(src, dest):
+                        raise OSError(f"Junction belum terverifikasi: {result.stderr or result.stdout}")
+                    if directory_manifest(backup) != before or directory_manifest(dest) != before:
+                        raise OSError("Isi aplikasi berubah selama pemindahan.")
+                    history = [record for record in load_moves_history() if record.get("original_path") != src]
+                    history.append({"name": item["name"], "original_path": src,
+                                    "target_path": dest, "size_bytes": item["size_bytes"],
+                                    "date": time.strftime("%Y-%m-%d %H:%M:%S")})
+                    save_moves_history(history)
+                    committed = True
+                    shutil.rmtree(backup)
+                    backup = None
+                    moved_success.append(item)
+                    self.log(f"SUKSES: {item['name']} dipindahkan; isi dan junction terverifikasi.")
+                except Exception as error:
+                    self.log(f"Pemindahan {item['name']} belum selesai: {error}")
+                    if backup and os.path.isdir(backup) and not committed:
+                        try:
+                            if os.path.lexists(src):
+                                if not is_junction(src) or not os.path.samefile(src, dest):
+                                    raise OSError("Lokasi asal berubah; rollback otomatis dibatalkan.")
+                                os.rmdir(src)
+                            os.rename(backup, src)
+                            backup = None
+                            self.log(f"Folder asal dipulihkan: {src}. Salinan tujuan dipertahankan di {dest}.")
+                        except Exception as rollback_error:
+                            self.log(f"ERROR rollback: {rollback_error}. Backup dipertahankan di {backup}.")
+                finally:
+                    if stage:
+                        try:
+                            shutil.rmtree(stage)
+                        except OSError as error:
+                            self.log(f"Staging dipertahankan di {stage}: {error}")
+                    if backup_container and backup is None:
+                        try:
+                            os.rmdir(backup_container)
+                        except OSError as error:
+                            self.log(f"Folder backup dipertahankan di {backup_container}: {error}")
+        except Exception as error:
+            self.log(f"Gagal memulai pemindahan: {error}")
+        finally:
+            def _finish_move():
+                try:
+                    successful_ids = {id(item) for item in moved_success}
+                    self.app_items = [item for item in self.app_items if id(item) not in successful_ids]
+                    for item in moved_success:
+                        row = item.get("row_widget")
+                        if row and row.winfo_exists():
+                            row.destroy()
+                    self.btn_move_apps.configure(state="normal", text="Pindahkan Terpilih (Junction)")
+                    self.refresh_restore_list()
+                finally:
+                    self.release_mutation_guard()
+            self.after(0, _finish_move)
 
     def refresh_restore_list(self):
         for w in self.restore_scroll.winfo_children():
@@ -1540,13 +1695,17 @@ class DevAICleanerApp(ctk.CTk):
             is_junc = is_junction(record["original_path"])
             status_text = "[Junction Aktif]" if is_junc else "[Junction Terputus]"
             status_color = "#16A34A" if is_junc else "#DC2626"
+            pending_cleanup = record.get("phase") == "restored_pending_cleanup"
+            if pending_cleanup:
+                status_text = "[Dipulihkan — pembersihan tertunda]"
+                status_color = "#EA580C"
 
             lbl_name = ctk.CTkLabel(row, text=record["name"], font=ctk.CTkFont(size=13, weight="bold"), anchor="w", width=220)
             lbl_name.pack(side="left", padx=15)
 
             btn_res = ctk.CTkButton(
                 row,
-                text="Kembalikan (Restore)",
+                text="Coba Bersihkan Target" if pending_cleanup else "Kembalikan (Restore)",
                 font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color="#0284C7",
                 hover_color="#0369A1",
@@ -1563,7 +1722,10 @@ class DevAICleanerApp(ctk.CTk):
             lbl_st.pack(side="right", padx=15)
 
     def confirm_and_restore_app(self, record):
+        if not self.acquire_mutation_guard("app_restore"):
+            return
         if not is_user_admin():
+            self.release_mutation_guard()
             messagebox.showerror(
                 "Memerlukan Akses Administrator",
                 "Mengembalikan aplikasi ke C:\\ dan melepas NTFS Junction memerlukan hak Administrator.\n\n"
@@ -1575,52 +1737,157 @@ class DevAICleanerApp(ctk.CTk):
         target = record["target_path"]
         sz = record.get("size_bytes", 0)
 
+        if record.get("phase") == "restored_pending_cleanup":
+            if messagebox.askyesno("Pembersihan Restore", f"Coba bersihkan salinan target '{record['name']}'?\nFolder asal akan diverifikasi ulang sebelum penghapusan."):
+                try:
+                    self.executor.submit(self._bg_retry_restore_cleanup, record)
+                except Exception as e:
+                    self.release_mutation_guard()
+                    self.log(f"Gagal menjalankan pembersihan retry: {e}")
+            else:
+                self.release_mutation_guard()
+            return
+
         # Space Check di C:
         try:
             usage = psutil.disk_usage("C:\\")
             if usage.free < (sz + 1024 * 1024 * 1024):
+                self.release_mutation_guard()
                 messagebox.showerror("Error", f"Drive C: tidak memiliki ruang cukup untuk restore!\nDibutuhkan: {format_size(sz + 1024*1024*1024)}\nTersedia: {format_size(usage.free)}")
                 return
         except Exception:
             pass
 
         if not messagebox.askyesno("Konfirmasi Restore", f"Kembalikan '{record['name']}' ke drive C: ({orig})?"):
+            self.release_mutation_guard()
             return
 
-        self.executor.submit(self._bg_restore_app, record)
+        try:
+            self.executor.submit(self._bg_restore_app, record)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.log(f"Gagal menjalankan restore: {e}")
+
+    def _bg_retry_restore_cleanup(self, record):
+        try:
+            history = load_moves_history()
+            matches = [entry for entry in history
+                       if entry.get("original_path") == record.get("original_path")]
+            if len(matches) != 1 or matches[0] != record:
+                raise OSError("Catatan recovery berubah; buka ulang daftar pemulihan.")
+            pending = matches[0]
+            if pending.get("phase") != "restored_pending_cleanup" or "manifest" not in pending:
+                raise OSError("Catatan pembersihan tertunda tidak valid.")
+            cleanup_verified_copy(pending["original_path"], pending["target_path"], pending["manifest"])
+            save_moves_history([entry for entry in history if entry is not pending])
+        except Exception as error:
+            self.log(f"Pembersihan restore masih tertunda: {error}. Catatan recovery dipertahankan.")
+            return
+        finally:
+            self.release_mutation_guard()
+        self.log(f"Pembersihan restore selesai: {record['name']}.")
+        self.after(0, self.refresh_restore_list)
 
     def _bg_restore_app(self, record):
         orig = record["original_path"]
         target = record["target_path"]
         self.log(f"Memulai proses restore: {record['name']}...")
 
-        stop_processes_in_folder(orig)
-        stop_processes_in_folder(target)
-
-        if is_junction(orig):
+        stage_path = None
+        junction_removed = False
+        cleanup_pending = False
+        try:
+            if not os.path.isdir(target) or is_junction(target) or os.path.islink(target):
+                raise OSError("Folder target restore tidak valid.")
+            if os.path.lexists(orig):
+                if not is_junction(orig) or not os.path.samefile(orig, target):
+                    raise OSError("Lokasi asal bukan junction ke target yang tercatat.")
             try:
+                common = os.path.commonpath([os.path.abspath(orig), os.path.abspath(target)])
+            except ValueError:
+                common = None  # Different drives cannot contain one another.
+            if common in (os.path.abspath(orig), os.path.abspath(target)):
+                raise OSError("Lokasi asal dan target tidak boleh saling bersarang.")
+            stop_processes_in_folder(orig)
+            stop_processes_in_folder(target)
+            before = directory_manifest(target)
+            stage_path = tempfile.mkdtemp(prefix=".mover-restore-", dir=os.path.dirname(orig))
+            cmd = ["robocopy", target, stage_path, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:3", "/W:1", "/NP", "/NFL", "/NDL", "/XJ"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
+                                 creationflags=hidden_console_creation_flags())
+            if not 0 <= res.returncode < 8:
+                raise OSError(f"Robocopy restore gagal (Exit code {res.returncode})")
+            if before != directory_manifest(stage_path) or before != directory_manifest(target):
+                raise OSError("Isi salinan restore tidak cocok atau target berubah; restore dibatalkan.")
+            if os.path.lexists(orig):
+                if not is_junction(orig) or not os.path.samefile(orig, target):
+                    raise OSError("Lokasi asal berubah selama restore.")
                 os.rmdir(orig)
-            except Exception as e:
-                self.log(f"Gagal melepas junction: {e}")
-                return
-
-        os.makedirs(orig, exist_ok=True)
-        cmd = ["robocopy", target, orig, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:3", "/W:1", "/NP", "/NFL", "/NDL", "/XJ"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode >= 8:
-            self.log(f"ERROR: Robocopy restore gagal (Exit code {res.returncode})")
+                junction_removed = True
+            try:
+                os.rename(stage_path, orig)
+                stage_path = None
+            except OSError:
+                if junction_removed and not os.path.lexists(orig):
+                    rollback = subprocess.run(["cmd", "/c", "mklink", "/J", orig, target],
+                                              capture_output=True, text=True,
+                                              creationflags=hidden_console_creation_flags())
+                    if rollback.returncode != 0 or not is_junction(orig) or not os.path.samefile(orig, target):
+                        self.log(f"ERROR: Rollback junction gagal. Data tetap tersedia di {target}.")
+                raise
+            history = [h for h in load_moves_history() if h.get("original_path") != orig]
+            pending = dict(record, phase="restored_pending_cleanup", manifest=before)
+            # Persist recovery bookkeeping before removing the redundant target copy.
+            try:
+                save_moves_history(history + [pending])
+                cleanup_pending = True
+            except Exception:
+                # Only roll back the copy we installed, never a changed application folder.
+                if (not is_junction(orig) and not os.path.islink(orig)
+                        and directory_manifest(orig) == before
+                        and directory_manifest(target) == before):
+                    stage_path = tempfile.mkdtemp(prefix=".mover-restore-", dir=os.path.dirname(orig))
+                    os.rmdir(stage_path)
+                    os.rename(orig, stage_path)
+                    if junction_removed:
+                        rollback = subprocess.run(["cmd", "/c", "mklink", "/J", orig, target],
+                                                  capture_output=True, text=True, timeout=30,
+                                                  creationflags=hidden_console_creation_flags())
+                        if (rollback.returncode != 0 or not is_junction(orig)
+                                or not os.path.samefile(orig, target)):
+                            self.log(f"ERROR: Rollback junction gagal. Data tetap tersedia di {target}.")
+                else:
+                    self.log(f"Lokasi asal berubah; pemulihan manual diperlukan: {orig}. Target disimpan: {target}.")
+                raise
+            cleanup_verified_copy(orig, target, before)
+            save_moves_history(history)
+        except Exception as error:
+            self.log(f"Restore belum selesai: {error}. Data pemulihan dipertahankan.")
+            if cleanup_pending:
+                self.after(0, self.refresh_restore_list)
+            self.release_mutation_guard()
             return
+        finally:
+            if stage_path is not None:
+                try:
+                    shutil.rmtree(stage_path)
+                except OSError as error:
+                    self.log(f"Staging restore dipertahankan di {stage_path}: {error}")
 
-        shutil.rmtree(target, ignore_errors=True)
-        history = load_moves_history()
-        history = [h for h in history if h.get("original_path") != orig]
-        save_moves_history(history)
-
-        self.log(f"SUKSES: {record['name']} berhasil dikembalikan 100% ke C:!")
-        def _update_ui_after_restore():
-            self.refresh_restore_list()
-            self.scan_installed_apps_async()
-        self.after(200, _update_ui_after_restore)
+        def _finish_restore():
+            try:
+                if not any(item.get("path") == orig for item in self.app_items):
+                    safe, reason = self.test_app_safety(record["name"], orig)
+                    item = {"name": record["name"], "path": orig,
+                            "size_bytes": record.get("size_bytes", 0),
+                            "is_safe": safe, "reason": reason, "var": None}
+                    self.app_items.append(item)
+                    self._render_app_row(item)
+                self.refresh_restore_list()
+            finally:
+                self.release_mutation_guard()
+        self.log(f"SUKSES: {record['name']} berhasil dikembalikan dan isi salinan terverifikasi.")
+        self.after(0, _finish_restore)
 
     # =============================================================
     # VIEW 3: PYTHON LIBRARY MANAGER (WINUP TABLE STYLE)
@@ -1676,18 +1943,22 @@ class DevAICleanerApp(ctk.CTk):
         self.lib_scroll.pack(fill="both", expand=True)
 
     def scan_libs_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian library ditunda.")
+            return
         if getattr(self, "is_scanning_libs", False):
             self.log("Peringatan: Pemindaian library sedang berjalan. Mohon tunggu...")
+            return
+        target_python = self._get_active_python_exe()
+        if not target_python:
+            self.log("Interpreter terpilih tidak ditemukan; pilih environment yang valid.")
             return
         self.is_scanning_libs = True
         if hasattr(self, "btn_scan_libs"):
             self.btn_scan_libs.configure(state="disabled", text="Memindai...")
 
         self.log("Memindai Python packages dan menghitung ukuran di disk...")
-        for w in self.lib_scroll.winfo_children():
-            w.destroy()
-        self.lib_items.clear()
-        self.executor.submit(self._bg_scan_libs)
+        self.executor.submit(self._bg_scan_libs, target_python)
 
     def _get_active_python_exe(self):
         if hasattr(self, "cmb_py_env") and hasattr(self, "py_envs"):
@@ -1695,15 +1966,15 @@ class DevAICleanerApp(ctk.CTk):
             exe = self.py_envs.get(sel)
             if exe and os.path.exists(exe):
                 return exe
+            return None
         if hasattr(self, "py_envs") and self.py_envs:
             for exe in self.py_envs.values():
                 if os.path.exists(exe):
                     return exe
         return sys.executable
 
-    def _bg_scan_libs(self):
+    def _bg_scan_libs(self, target_python):
         try:
-            target_python = self._get_active_python_exe()
             msg_init = f"Menggunakan Python environment: {target_python}"
             self.log(msg_init)
             log_py_debug("=== Memulai Scan Library ===")
@@ -1766,11 +2037,12 @@ class DevAICleanerApp(ctk.CTk):
                 try:
                     log_py_debug(f"Menjalankan subprocess scan pada: {target_python}")
                     cmd = [target_python, "-c", extract_script]
-                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                       creationflags=hidden_console_creation_flags())
                     log_py_debug(f"Subprocess returncode: {p.returncode}")
                     if p.returncode == 0 and p.stdout.strip():
                         raw_data = json.loads(p.stdout.strip())
-                        if isinstance(raw_data, list) and raw_data:
+                        if isinstance(raw_data, list):
                             for item in raw_data:
                                 name = item.get("name", "")
                                 libs.append({
@@ -1779,6 +2051,7 @@ class DevAICleanerApp(ctk.CTk):
                                     "size_bytes": item.get("size_bytes", 0),
                                     "used_by": item.get("used_by", []),
                                     "is_core": name.lower() in PROTECTED_PACKAGES,
+                                    "python_exe": target_python,
                                     "var": None
                                 })
                             proc_success = True
@@ -1793,99 +2066,17 @@ class DevAICleanerApp(ctk.CTk):
             else:
                 log_py_debug(f"target_python tidak valid atau tidak ditemukan: {target_python}")
 
-            # Fallback jika subprocess scan gagal / tidak menghasilkan packages
-            if not proc_success or not libs:
-                log_py_debug("Menjalankan fallback in-process metadata scan...")
-                search_paths = set()
-                # Cek site-packages milik target_python
-                if target_python and os.path.exists(target_python):
-                    py_dir = os.path.dirname(target_python)
-                    sp_candidates = [
-                        os.path.join(py_dir, "Lib", "site-packages"),
-                        os.path.join(py_dir, "lib", "site-packages"),
-                        os.path.join(os.path.dirname(py_dir), "Lib", "site-packages"),
-                    ]
-                    for spc in sp_candidates:
-                        if os.path.exists(spc):
-                            search_paths.add(spc)
-                            log_py_debug(f"Menambahkan candidate site-packages dari target_python: {spc}")
-
-                # Tambahkan search paths default sistem
-                for p in sys.path:
-                    search_paths.add(p)
-                try:
-                    import site
-                    for p in site.getsitepackages():
-                        search_paths.add(p)
-                    search_paths.add(site.getusersitepackages())
-                except Exception as se:
-                    log_py_debug(f"Gagal mengambil site packages lokal: {se}")
-
-                valid_paths = [p for p in search_paths if os.path.exists(p)]
-                log_py_debug(f"Valid search paths fallback ({len(valid_paths)}): {valid_paths}")
-
-                dists = list(importlib.metadata.distributions(path=valid_paths))
-                log_py_debug(f"Distributions ditemukan via fallback: {len(dists)}")
-
-                unique_dists = {}
-                for d in dists:
-                    try:
-                        pkg_name = d.metadata["Name"].lower()
-                        if pkg_name not in unique_dists:
-                            unique_dists[pkg_name] = d
-                    except Exception:
-                        pass
-
-                dep_map = {}
-                for d in unique_dists.values():
-                    try:
-                        pkg_name = d.metadata["Name"].lower()
-                        reqs = d.requires or []
-                        for r in reqs:
-                            clean_r = re.split(r'[; \(\)<>=!]', r)[0].strip().lower()
-                            if clean_r:
-                                dep_map.setdefault(clean_r, []).append(d.metadata["Name"])
-                    except Exception:
-                        pass
-
-                libs = []
-                for d in unique_dists.values():
-                    try:
-                        name = d.metadata["Name"]
-                        ver = d.version
-                        sz = 0
-                        if d.files:
-                            for f in d.files:
-                                try:
-                                    fp = d.locate_file(f)
-                                    if os.path.exists(fp) and os.path.isfile(fp):
-                                        sz += os.path.getsize(fp)
-                                except Exception:
-                                    pass
-                        if sz == 0:
-                            loc = d.locate_file("")
-                            if loc.exists():
-                                sz = get_directory_size_bytes(str(loc))
-
-                        used_by = dep_map.get(name.lower(), [])
-                        is_core = name.lower() in PROTECTED_PACKAGES
-
-                        item = {
-                            "name": name,
-                            "version": ver,
-                            "size_bytes": sz,
-                            "used_by": used_by,
-                            "is_core": is_core,
-                            "var": None
-                        }
-                        libs.append(item)
-                    except Exception:
-                        pass
+            if not proc_success:
+                raise RuntimeError("Pemindaian interpreter terpilih gagal; paket dari environment lain tidak digunakan.")
 
             libs.sort(key=lambda x: x["size_bytes"], reverse=True)
-            self.lib_items = libs
-            for it in libs:
-                self._render_lib_row(it)
+            def _apply_library_scan():
+                for widget in self.lib_scroll.winfo_children():
+                    widget.destroy()
+                self.lib_items = libs
+                for item in libs:
+                    self._render_lib_row(item)
+            self.after(0, _apply_library_scan)
 
             success_msg = f"Pemindaian selesai. Terpasang {len(libs)} packages."
             self.log(success_msg)
@@ -1953,32 +2144,77 @@ class DevAICleanerApp(ctk.CTk):
                 it["var"].set(val)
 
     def confirm_and_uninstall_libs(self):
+        if not self.acquire_mutation_guard("lib_uninstall"):
+            return
         selected = [it for it in self.lib_items if it.get("var") and it["var"].get() and not it["is_core"]]
         if not selected:
+            self.release_mutation_guard()
             messagebox.showinfo("Informasi", "Pilih minimal satu library yang tidak dilindungi untuk di-uninstall.")
             return
 
         names = [it["name"] for it in selected]
         if not messagebox.askyesno("Konfirmasi Uninstall", f"Uninstall {len(names)} package berikut?\n{', '.join(names[:5])}"):
+            self.release_mutation_guard()
             return
 
-        self.executor.submit(self._bg_uninstall_libs, names)
+        interpreters = {item.get("python_exe") for item in selected}
+        if len(interpreters) != 1 or None in interpreters:
+            self.release_mutation_guard()
+            self.log("Interpreter hasil scan tidak valid; pindai ulang secara manual sebelum uninstall.")
+            return
+        target_py = interpreters.pop()
+        try:
+            self.executor.submit(self._bg_uninstall_libs, selected, target_py)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.log(f"Gagal menjalankan thread uninstall library: {e}")
 
-    def _bg_uninstall_libs(self, names):
-        target_py = self._get_active_python_exe()
-        log_py_debug(f"=== Menjalankan Uninstall Libraries pada Python: {target_py} ===")
-        for n in names:
-            self.log(f"Menjalankan: pip uninstall -y {n}...")
-            log_py_debug(f"Uninstalling {n} via {target_py} -m pip...")
-            cmd = [target_py, "-m", "pip", "uninstall", "-y", n]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                self.log(f"SUKSES: {n} berhasil di-uninstall.")
-                log_py_debug(f"SUKSES uninstall {n}")
-            else:
-                self.log(f"Gagal uninstall {n}: {res.stderr}")
-                log_py_debug(f"GAGAL uninstall {n}: {res.stderr}")
-        self.after(200, self.scan_libs_async)
+    def _bg_uninstall_libs(self, selected_items, target_py):
+        removed_names = set()
+        removed_ids = set()
+        for item in selected_items:
+            name = item["name"]
+            self.log(f"Menjalankan: pip uninstall -y {name} melalui {target_py}...")
+            cmd = [target_py, "-m", "pip", "uninstall", "-y", name]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    creationflags=hidden_console_creation_flags()
+                )
+                verify = subprocess.run(
+                    [target_py, "-c", "import importlib.metadata as m, json, re, sys; "
+                     "norm = lambda n: re.sub(r'[-_.]+', '-', n).lower(); "
+                     "print(json.dumps(any(norm(d.metadata.get('Name', '')) == norm(sys.argv[1]) "
+                     "for d in m.distributions())))", name],
+                    capture_output=True, text=True,
+                    creationflags=hidden_console_creation_flags()
+                )
+                if result.returncode == 0 and verify.returncode == 0 and json.loads(verify.stdout) is False:
+                    removed_names.add(name)
+                    removed_ids.add(id(item))
+                    self.log(f"Terverifikasi terhapus dari {target_py}: {name}")
+                else:
+                    self.log(f"Uninstall {name} belum terverifikasi (pip exit {result.returncode}); item dipertahankan.")
+                    if result.stderr.strip():
+                        self.log(result.stderr.strip())
+            except Exception as error:
+                self.log(f"Gagal uninstall/verifikasi {name}: {error}")
+
+        def _update_library_state():
+            try:
+                self.lib_items = [it for it in self.lib_items if id(it) not in removed_ids]
+                for item in selected_items:
+                    if id(item) in removed_ids:
+                        row = item.get("row_widget")
+                        if row and row.winfo_exists():
+                            row.destroy()
+                if hasattr(self, "ent_lib_search"):
+                    self.filter_libs()
+            finally:
+                self.release_mutation_guard()
+
+        self.after(0, _update_library_state)
+        log_py_debug(f"Package removal verified for interpreter {target_py}: {sorted(removed_names)}")
 
     # =============================================================
     # VIEW 4: STARTUP & WINDOWS SERVICES MANAGER
@@ -2050,6 +2286,9 @@ class DevAICleanerApp(ctk.CTk):
             self.scan_services_async()
 
     def scan_startup_items_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian Startup ditunda.")
+            return
         if getattr(self, "is_scanning_startup", False):
             self.log("Peringatan: Pemindaian Startup sedang berjalan. Mohon tunggu...")
             return
@@ -2136,6 +2375,8 @@ class DevAICleanerApp(ctk.CTk):
             st_color = "#16A34A" if item["is_enabled"] else "#64748B"
             lbl_st = ctk.CTkLabel(row, text=st_text, font=ctk.CTkFont(size=11, weight="bold"), text_color=st_color, width=90)
             lbl_st.pack(side="right", padx=15)
+            item["status_widget"] = lbl_st
+            item["action_widget"] = btn_toggle
 
             # Command line truncated
             cmd_str = item["cmd"]
@@ -2147,24 +2388,42 @@ class DevAICleanerApp(ctk.CTk):
         self.after(0, _render)
 
     def toggle_startup_state(self, item):
+        if not self.acquire_mutation_guard("startup_toggle"):
+            return
         root_h = item["root_h"]
         name = item["name"]
         new_state = not item["is_enabled"]
         appr_sub = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
         try:
-            k = winreg.OpenKey(root_h, appr_sub, 0, winreg.KEY_SET_VALUE)
-            val_bytes = b'\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' if new_state else b'\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-            winreg.SetValueEx(k, name, 0, winreg.REG_BINARY, val_bytes)
+            val_bytes = (b'\x02' if new_state else b'\x03') + bytes(11)
+            with winreg.OpenKey(root_h, appr_sub, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+                winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, val_bytes)
+                actual, value_type = winreg.QueryValueEx(key, name)
+                if value_type != winreg.REG_BINARY or actual != val_bytes:
+                    raise OSError("Nilai StartupApproved tidak cocok setelah ditulis.")
             item["is_enabled"] = new_state
+            status = item.get("status_widget")
+            button = item.get("action_widget")
+            if status and status.winfo_exists():
+                status.configure(text="[AKTIF]" if new_state else "[NONAKTIF]",
+                                 text_color="#16A34A" if new_state else "#64748B")
+            if button and button.winfo_exists():
+                button.configure(text="Nonaktifkan" if new_state else "Aktifkan",
+                                 fg_color="#EA580C" if new_state else "#16A34A",
+                                 hover_color="#C2410C" if new_state else "#15803D")
             st_msg = "diaktifkan" if new_state else "dinonaktifkan"
             self.log(f"Startup item '{name}' berhasil {st_msg}.")
-            self.scan_startup_items_async()
         except Exception as e:
             self.log(f"Gagal mengubah status startup '{name}': {e}")
             messagebox.showerror("Error", f"Gagal mengubah status startup:\n{e}\nPastikan aplikasi dijalankan dengan hak Administrator.")
+        finally:
+            self.release_mutation_guard()
 
     def scan_services_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian Services ditunda.")
+            return
         if getattr(self, "is_scanning_services", False):
             self.log("Peringatan: Pemindaian Services sedang berjalan. Mohon tunggu...")
             return
@@ -2238,6 +2497,8 @@ class DevAICleanerApp(ctk.CTk):
             st_color = "#16A34A" if is_running else "#64748B"
             lbl_st = ctk.CTkLabel(row, text=f"[{item['status'].upper()}]", font=ctk.CTkFont(size=11, weight="bold"), text_color=st_color, width=95)
             lbl_st.pack(side="right", padx=15)
+            item["status_widget"] = lbl_st
+            item["action_widget"] = btn_act
 
             lbl_type = ctk.CTkLabel(row, text=f"Startup: {item['start_type']}", font=ctk.CTkFont(size=11), text_color="#94A3B8", width=120, anchor="e")
             lbl_type.pack(side="right", padx=15)
@@ -2245,21 +2506,50 @@ class DevAICleanerApp(ctk.CTk):
         self.after(0, _render)
 
     def toggle_service_state(self, item):
+        if not self.acquire_mutation_guard("service_toggle"):
+            return
         name = item["name"]
         is_running = item["status"] == "running"
         action = "stop" if is_running else "start"
         self.log(f"Menjalankan: sc.exe {action} {name}...")
 
         def _bg():
-            cmd = ["sc.exe", action, name]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
+            try:
+                res = subprocess.run(
+                    ["sc.exe", action, name], capture_output=True, text=True,
+                    creationflags=hidden_console_creation_flags()
+                )
+                if res.returncode != 0:
+                    self.log(f"Peringatan sc.exe: {res.stdout.strip() or res.stderr.strip()}")
+                    return
+                expected = "stopped" if action == "stop" else "running"
+                actual = psutil.win_service_get(name).status()
+                if actual != expected:
+                    self.log(f"Status layanan '{name}' belum terverifikasi ({actual}); gunakan Segarkan Data untuk memeriksa lagi.")
+                    return
+                def _update():
+                    item["status"] = actual
+                    running = actual == "running"
+                    status = item.get("status_widget")
+                    button = item.get("action_widget")
+                    if status and status.winfo_exists():
+                        status.configure(text=f"[{actual.upper()}]", text_color="#16A34A" if running else "#64748B")
+                    if button and button.winfo_exists():
+                        button.configure(text="Stop Service" if running else "Start Service",
+                                         fg_color="#DC2626" if running else "#16A34A",
+                                         hover_color="#B91C1C" if running else "#15803D")
+                self.after(0, _update)
                 self.log(f"Layanan '{name}' berhasil di-{action}!")
-            else:
-                self.log(f"Peringatan sc.exe: {res.stdout.strip() or res.stderr.strip()}")
-            self.after(500, self.scan_services_async)
+            except Exception as error:
+                self.log(f"Gagal menjalankan/verifikasi layanan '{name}': {error}")
+            finally:
+                self.release_mutation_guard()
 
-        self.executor.submit(_bg)
+        try:
+            self.executor.submit(_bg)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.log(f"Gagal menjalankan thread toggle service: {e}")
 
     # =============================================================
     # VIEW: DUPLICATE FILE FINDER (SAFE RECYCLE BIN & AUTO-SELECT)
@@ -2388,6 +2678,9 @@ class DevAICleanerApp(ctk.CTk):
             self.log(f"Gagal mengatur Storage Sense registry: {e}")
 
     def start_dup_scan_async(self):
+        if getattr(self, "active_mutation", None) is not None:
+            self.log(f"Operasi '{self.active_mutation}' sedang berlangsung; pemindaian file duplikat ditunda.")
+            return
         if getattr(self, "is_scanning_dup", False):
             self.log("Peringatan: Pemindaian file duplikat sedang berjalan. Mohon tunggu proses selesai.")
             return
@@ -2578,7 +2871,9 @@ class DevAICleanerApp(ctk.CTk):
                 row.pack(fill="x", padx=4, pady=2)
                 row.pack_propagate(False)
 
-                var = tk.BooleanVar(value=item["is_newest"]) # Default select newest
+                var = item.get("var")
+                if var is None:
+                    var = tk.BooleanVar(value=item["is_newest"]) # Default select newest
                 item["var"] = var
                 chk = ctk.CTkCheckBox(row, text="", variable=var, width=25, checkbox_width=18, checkbox_height=18, command=self.update_dup_savings_counter)
                 chk.pack(side="left", padx=(10, 5))
@@ -2659,8 +2954,11 @@ class DevAICleanerApp(ctk.CTk):
             self.log(f"Error membuka file di explorer: {e}")
 
     def confirm_and_delete_duplicates(self):
+        if not self.acquire_mutation_guard("dup_delete"):
+            return
         selected = [it for it in self.dup_items if it.get("var") and it["var"].get()]
         if not selected:
+            self.release_mutation_guard()
             messagebox.showinfo("Informasi", "Pilih minimal satu file duplikat untuk dibersihkan.")
             return
 
@@ -2673,31 +2971,54 @@ class DevAICleanerApp(ctk.CTk):
             "Lanjutkan penghapusan aman?"
         )
         if not messagebox.askyesno("Konfirmasi Safe Duplicate Cleaner", msg):
+            self.release_mutation_guard()
             return
 
         self.btn_dup_delete.configure(state="disabled")
         self.log(f"Memindahkan {len(selected)} file duplikat ke Recycle Bin...")
-        self.executor.submit(self._bg_delete_duplicates, selected)
+        try:
+            self.executor.submit(self._bg_delete_duplicates, selected)
+        except Exception as e:
+            self.release_mutation_guard()
+            self.btn_dup_delete.configure(state="normal")
+            self.log(f"Gagal menjalankan thread delete duplikat: {e}")
 
     def _bg_delete_duplicates(self, selected_items):
-        success_count = 0
+        successful_paths = set()
         saved_bytes = 0
 
         for it in selected_items:
             fp = it["path"]
             try:
+                if not os.path.exists(fp):
+                    self.log(f"File tidak ditemukan; dipertahankan dalam daftar: {fp}")
+                    continue
+                send2trash(fp)
                 if os.path.exists(fp):
-                    sz = it["size_bytes"]
-                    send2trash(fp)
-                    success_count += 1
-                    saved_bytes += sz
-                    self.log(f"Ke Recycle Bin: {os.path.basename(fp)}")
+                    self.log(f"File masih ada setelah dikirim ke Recycle Bin; dipertahankan: {fp}")
+                    continue
+                successful_paths.add(fp)
+                saved_bytes += it["size_bytes"]
+                self.log(f"Ke Recycle Bin: {os.path.basename(fp)}")
             except Exception as e:
                 self.log(f"Gagal memindahkan {fp} ke Recycle Bin: {e}")
 
-        self.log(f"PEMBERSIHAN SELESAI: {success_count} file duplikat dipindahkan. {format_size(saved_bytes)} ruang disk dihemat!")
-        self.after(0, lambda: self.btn_dup_delete.configure(state="normal"))
-        self.after(200, self.start_dup_scan_async)
+        self.log(f"PEMBERSIHAN SELESAI: {len(successful_paths)} file duplikat dipindahkan. {format_size(saved_bytes)} ruang disk dihemat!")
+
+        def _update_duplicate_state():
+            try:
+                self.dup_items = [it for it in self.dup_items if it.get("path") not in successful_paths]
+                self.dup_groups = [
+                    {**group, "items": [it for it in group["items"] if it.get("path") not in successful_paths]}
+                    for group in self.dup_groups
+                ]
+                self.dup_groups = [group for group in self.dup_groups if group["items"]]
+                self.btn_dup_delete.configure(state="normal")
+                self._render_all_dup_groups()
+            finally:
+                self.release_mutation_guard()
+
+        self.after(0, _update_duplicate_state)
 
     # =============================================================
     # VIEW: GHOST TOOLBOX (TWEAKS, REPAIRS, RUNTIMES & REPO TRACKER)
@@ -2852,18 +3173,25 @@ class DevAICleanerApp(ctk.CTk):
                 "#0284C7"
             ),
             (
-                "DISM RestoreHealth Image Repair",
-                "Memperbaiki citra sistem Windows (Windows System Image) menggunakan Windows Update source online.",
-                "Restore Health",
-                self.run_dism_restorehealth,
+                "Windows Update Repair",
+                "Mendiagnosis dan memperbaiki komponen update Windows menggunakan service dan utility bawaan.",
+                "Perbaiki Update",
+                self.repair_windows_update,
+                "#0284C7"
+            ),
+            (
+                "Repair Microsoft Store",
+                "Reset cache Microsoft Store melalui utility wsreset bawaan Windows.",
+                "Reset Store",
+                self.reset_store_cache,
                 "#9333EA"
             ),
             (
-                "Bersihkan Cache Windows Update (SoftwareDistribution)",
-                "Menghentikan sementara update service dan menghapus installer sisa di SoftwareDistribution\\Download.",
-                "Bersihkan Update Cache",
-                self.clean_windows_update_cache,
-                "#EA580C"
+                "Windows Activation Status",
+                "Tampilkan informasi status aktivasi Windows menggunakan slmgr bawaan.",
+                "Cek Aktivasi",
+                self.check_activation_status,
+                "#CA8A04"
             )
         ]
 
@@ -2875,86 +3203,219 @@ class DevAICleanerApp(ctk.CTk):
             info_f = ctk.CTkFrame(card, fg_color="transparent")
             info_f.pack(side="left", padx=15, pady=8)
 
-            lbl_t = ctk.CTkLabel(info_f, text=title, font=ctk.CTkFont(size=12, weight="bold"), anchor="w")
-            lbl_t.pack(anchor="w")
+            ctk.CTkLabel(info_f, text=title, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_f, text=desc, font=ctk.CTkFont(size=11), text_color="#94A3B8", anchor="w").pack(anchor="w")
 
-            lbl_d = ctk.CTkLabel(info_f, text=desc, font=ctk.CTkFont(size=11), text_color="#94A3B8", anchor="w")
-            lbl_d.pack(anchor="w")
-
-            btn = ctk.CTkButton(
-                card,
-                text=btn_txt,
-                font=ctk.CTkFont(size=11, weight="bold"),
-                fg_color=btn_col,
-                width=150,
-                height=30,
-                command=cmd
-            )
+            btn = ctk.CTkButton(card, text=btn_txt, font=ctk.CTkFont(size=11, weight="bold"), fg_color=btn_col, width=135, height=30, command=cmd)
             btn.pack(side="right", padx=15, pady=16)
 
     def _setup_ghost_runtimes_view(self):
         container = self.ghost_frames["runtimes"]
 
-        lbl_desc = ctk.CTkLabel(
-            container,
-            text="Komponen Runtime Penting untuk Game & Aplikasi Dev (Visual C++, DirectX, .NET Runtime):",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#94A3B8"
-        )
-        lbl_desc.pack(anchor="w", padx=4, pady=(5, 8))
-
         runtimes = [
             (
-                "Microsoft Visual C++ Redistributable (x64 / x86)",
-                "Dibutuhkan oleh game, software C++, Python wheels, dan Node native addons.",
-                self.check_vcredist_status(),
-                "Install via Winget",
-                lambda: self.install_runtime_winget("Microsoft.VCRedist.2015+.x64")
+                "Essential Runtime Checker",
+                "Periksa runtime .NET, Visual C++, DirectX, dan Java yang tersedia di sistem.",
+                "Cek Runtime",
+                self.check_essential_runtimes,
+                "#16A34A"
             ),
             (
-                "Microsoft .NET Desktop Runtime (x64)",
-                "Dibutuhkan oleh aplikasi desktop Windows modern dan CLI tools.",
-                self.check_dotnet_status(),
-                "Install via Winget",
-                lambda: self.install_runtime_winget("Microsoft.DotNet.DesktopRuntime.8")
+                "Install Visual C++ Redistributable",
+                "Buka sumber resmi Microsoft untuk mengunduh runtime Visual C++ terbaru.",
+                "Buka Download",
+                self.open_vcredist_download,
+                "#0284C7"
             ),
             (
-                "DirectX End-User Runtimes (June 2010)",
-                "Dibutuhkan oleh game klasik dan engine grafis DirectX 9/10/11.",
-                "Siap Diinstal",
-                "Install DirectX",
-                lambda: self.install_runtime_winget("Microsoft.DirectX")
+                "Install .NET Desktop Runtime",
+                "Buka sumber resmi Microsoft untuk memilih .NET Desktop Runtime.",
+                "Buka Download",
+                self.open_dotnet_download,
+                "#9333EA"
+            ),
+            (
+                "Install DirectX Runtime",
+                "Buka sumber resmi Microsoft untuk mengunduh DirectX End-User Runtime.",
+                "Buka Download",
+                self.open_directx_download,
+                "#CA8A04"
+            ),
+            (
+                "Install Java Runtime",
+                "Buka sumber resmi Adoptium untuk mengunduh Eclipse Temurin.",
+                "Buka Download",
+                self.open_java_download,
+                "#16A34A"
             )
         ]
 
-        for name, desc, status, btn_txt, cmd in runtimes:
-            card = ctk.CTkFrame(container, corner_radius=6, fg_color="#18191C", height=60)
+        for title, desc, btn_txt, cmd, btn_col in runtimes:
+            card = ctk.CTkFrame(container, corner_radius=6, fg_color="#18191C", height=65)
             card.pack(fill="x", padx=0, pady=4)
             card.pack_propagate(False)
 
             info_f = ctk.CTkFrame(card, fg_color="transparent")
             info_f.pack(side="left", padx=15, pady=8)
 
-            lbl_t = ctk.CTkLabel(info_f, text=name, font=ctk.CTkFont(size=12, weight="bold"), anchor="w")
-            lbl_t.pack(anchor="w")
+            ctk.CTkLabel(info_f, text=title, font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info_f, text=desc, font=ctk.CTkFont(size=11), text_color="#94A3B8", anchor="w").pack(anchor="w")
 
-            lbl_d = ctk.CTkLabel(info_f, text=desc, font=ctk.CTkFont(size=11), text_color="#94A3B8", anchor="w")
-            lbl_d.pack(anchor="w")
-
-            btn = ctk.CTkButton(
-                card,
-                text=btn_txt,
-                font=ctk.CTkFont(size=11, weight="bold"),
-                fg_color="#0284C7",
-                width=135,
-                height=28,
-                command=cmd
-            )
+            btn = ctk.CTkButton(card, text=btn_txt, font=ctk.CTkFont(size=11, weight="bold"), fg_color=btn_col, width=135, height=30, command=cmd)
             btn.pack(side="right", padx=15, pady=16)
 
-            st_col = "#16A34A" if "Terinstal" in status else "#38BDF8"
-            lbl_st = ctk.CTkLabel(card, text=f"[{status}]", font=ctk.CTkFont(size=11, weight="bold"), text_color=st_col, width=120)
-            lbl_st.pack(side="right", padx=10)
+    def _setup_ghost_link_checker_view(self):
+        container = self.ghost_frames["link_checker"]
+
+        self.link_checker_url_var = tk.StringVar()
+        self.link_checker_status = tk.StringVar(value="Ready")
+
+        ctk.CTkLabel(container, text="Link Checker", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=12, pady=(12, 4))
+        ctk.CTkLabel(container, text="Masukkan URL untuk memeriksa ketersediaan link.", font=ctk.CTkFont(size=12), text_color="#94A3B8").pack(anchor="w", padx=12, pady=4)
+
+        self.ent_link_checker = ctk.CTkEntry(container, textvariable=self.link_checker_url_var, placeholder_text="https://example.com", width=420)
+        self.ent_link_checker.pack(anchor="w", padx=12, pady=8)
+
+        self.btn_link_checker = ctk.CTkButton(container, text="Cek Link", command=self.check_link)
+        self.btn_link_checker.pack(anchor="w", padx=12, pady=4)
+
+        self.lbl_link_checker_status = ctk.CTkLabel(container, textvariable=self.link_checker_status, font=ctk.CTkFont(size=11), text_color="#94A3B8")
+        self.lbl_link_checker_status.pack(anchor="w", padx=12, pady=4)
+
+    def check_link(self):
+        url = self.link_checker_url_var.get().strip()
+        if not url:
+            self.link_checker_status.set("Masukkan URL terlebih dahulu")
+            return
+
+        self.link_checker_status.set("Memeriksa...")
+        self.executor.submit(self._bg_check_link, url)
+
+    def _bg_check_link(self, url):
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "DevAICleaner/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                code = response.status
+                final_url = response.geturl()
+            text = f"HTTP {code} — {final_url}"
+        except urllib.error.HTTPError as error:
+            text = f"HTTP {error.code} — {url}"
+        except Exception as error:
+            text = f"Gagal: {error}"
+
+        self.after(0, lambda t=text: self.link_checker_status.set(t))
+
+    def open_vcredist_download(self):
+        webbrowser.open("https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist")
+
+    def open_dotnet_download(self):
+        webbrowser.open("https://dotnet.microsoft.com/download/dotnet")
+
+    def open_directx_download(self):
+        webbrowser.open("https://www.microsoft.com/download/details.aspx?id=35")
+
+    def open_java_download(self):
+        webbrowser.open("https://adoptium.net/temurin/releases/")
+
+    def check_essential_runtimes(self):
+        checks = []
+        try:
+            proc = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, creationflags=hidden_console_creation_flags())
+            if proc.returncode == 0:
+                checks.append(".NET: " + (proc.stdout.strip().replace("\n", ", ") or "tidak ada runtime"))
+            else:
+                checks.append(".NET: tidak tersedia")
+        except FileNotFoundError:
+            checks.append(".NET: tidak tersedia")
+        except Exception as error:
+            checks.append(f".NET: gagal diperiksa ({error})")
+
+        self.log("Pemeriksaan runtime: " + " | ".join(checks))
+        messagebox.showinfo("Essential Runtimes", "\n".join(checks))
+
+    def run_dism_cleanup(self):
+        if not messagebox.askyesno("Konfirmasi DISM", "Jalankan DISM Component Cleanup? Operasi ini mungkin memerlukan waktu dan hak Administrator."):
+            return
+        self.executor.submit(self._run_console_tool, ["dism", "/Online", "/Cleanup-Image", "/StartComponentCleanup"])
+
+    def run_sfc_scan(self):
+        self.executor.submit(self._run_console_tool, ["sfc", "/scannow"])
+
+    def _run_console_tool(self, cmd):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=hidden_console_creation_flags())
+            output = proc.stdout.strip() or proc.stderr.strip()
+            if output:
+                self.log(output)
+            self.log(f"Perintah selesai dengan exit code {proc.returncode}: {' '.join(cmd)}")
+        except Exception as error:
+            self.log(f"Gagal menjalankan {' '.join(cmd)}: {error}")
+
+    def disable_telemetry(self):
+        def _bg():
+            for cmd in (["sc.exe", "stop", "DiagTrack"], ["sc.exe", "config", "DiagTrack", "start=", "disabled"]):
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=hidden_console_creation_flags())
+                    if proc.returncode:
+                        self.log(proc.stdout.strip() or proc.stderr.strip())
+                except Exception as error:
+                    self.log(f"Gagal menjalankan {' '.join(cmd)}: {error}")
+        self.executor.submit(_bg)
+
+    def apply_dns_flush(self):
+        self.executor.submit(self._run_console_tool, ["ipconfig", "/flushdns"])
+
+    def repair_windows_update(self):
+        cmds = (["sc.exe", "stop", "wuauserv"], ["sc.exe", "start", "wuauserv"])
+        self.executor.submit(self._run_console_sequence, cmds)
+
+    def _run_console_sequence(self, commands):
+        for cmd in commands:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=hidden_console_creation_flags())
+                if proc.returncode:
+                    self.log(proc.stdout.strip() or proc.stderr.strip())
+            except Exception as error:
+                self.log(f"Gagal menjalankan {' '.join(cmd)}: {error}")
+
+    def apply_ultimate_performance(self):
+        self.executor.submit(self._run_console_tool, ["powercfg", "/duplicatescheme", "e9a42b02-d5df-448d-aa00-03f14749eb61"])
+
+    def disable_gamedvr(self):
+        try:
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"System\GameConfigStore", 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, "GameDVR_Enabled", 0, winreg.REG_DWORD, 0)
+            self.log("GameDVR background recording dinonaktifkan.")
+        except Exception as error:
+            self.log(f"Gagal mengubah GameDVR: {error}")
+
+    def disable_bing_start(self):
+        try:
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Policies\Microsoft\Windows\Explorer", 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, "DisableSearchBoxSuggestions", 0, winreg.REG_DWORD, 1)
+            self.log("Bing web search Start Menu dinonaktifkan.")
+        except Exception as error:
+            self.log(f"Gagal mengubah kebijakan Bing Start: {error}")
+
+    def reset_store_cache(self):
+        self.executor.submit(self._run_console_tool, ["wsreset.exe"])
+
+    def check_activation_status(self):
+        self.executor.submit(self._run_console_tool, ["cscript.exe", "//Nologo", "slmgr.vbs", "/xpr"])
+
+    def _save_startup_scan_preference(self):
+        if not save_startup_scan_preference(STARTUP_SCAN_PREFERENCE_FILE, self.startup_scan_var.get()):
+            self.log("Preferensi Smart Scan startup gagal disimpan; pemindaian otomatis saat startup dinonaktifkan.")
+
+    def auto_initial_scan(self):
+        if self.__dict__.get("_startup_scan_dispatched", False):
+            return
+        self._startup_scan_dispatched = True
+        if getattr(self, "startup_scan_var", None) and self.startup_scan_var.get():
+            self.start_smart_scan_async()
+        else:
+            self.log("Smart Scan startup dinonaktifkan; mulai scan secara manual bila diperlukan.")
+
 
     def _setup_ghost_native_setup_view(self):
         container = self.ghost_frames["native_setup"]
@@ -3042,14 +3503,17 @@ class DevAICleanerApp(ctk.CTk):
         self.active_download_cancellations = {} # {app_id: bool}
         self._load_native_catalog()
 
+
     def _get_cleaner_downloads_dir(self):
         dl_dir = os.path.join(os.path.expanduser("~"), "Downloads", "Cleaner_App_Installers")
         os.makedirs(dl_dir, exist_ok=True)
         return dl_dir
 
+
     def _open_cleaner_downloads_folder(self):
         dl_dir = self._get_cleaner_downloads_dir()
         os.startfile(dl_dir)
+
 
     def _scan_installed_registry_apps(self):
         """Memindai registry Windows untuk mendeteksi software yang terpasang di sistem."""
@@ -3108,6 +3572,7 @@ class DevAICleanerApp(ctk.CTk):
 
         return installed
 
+
     def _load_native_catalog(self):
         cat_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_catalog.json")
         if not os.path.exists(cat_file):
@@ -3124,6 +3589,7 @@ class DevAICleanerApp(ctk.CTk):
         # Pindai registry Windows untuk deteksi status & perintah uninstall
         self.installed_registry_map = self._scan_installed_registry_apps()
         self._render_native_apps(self.native_app_data)
+
 
     def _render_native_apps(self, items):
         for w in self.native_app_scroll.winfo_children():
@@ -3271,6 +3737,7 @@ class DevAICleanerApp(ctk.CTk):
             lbl_st.pack(side="right", padx=(4, 10))
             self.native_app_status_labels[app_id] = lbl_st
 
+
     def _filter_native_apps(self):
         q = self.native_app_search.get().lower().strip()
         cat = self.native_app_cat.get()
@@ -3284,6 +3751,7 @@ class DevAICleanerApp(ctk.CTk):
                     continue
             res.append(it)
         self._render_native_apps(res)
+
 
     def _uninstall_native_app_async(self, item, reg_match=None):
         name = item.get("name", "Software")
@@ -3326,7 +3794,7 @@ class DevAICleanerApp(ctk.CTk):
                     shell=True,
                     capture_output=True,
                     text=True,
-                    creationflags=0x08000000 if os.name == 'nt' else 0
+                    creationflags=hidden_console_creation_flags()
                 )
                 self.log(f"Proses uninstall {name} selesai dengan returncode: {proc.returncode}")
 
@@ -3344,6 +3812,7 @@ class DevAICleanerApp(ctk.CTk):
                 messagebox.showerror("Gagal Uninstall", f"Terjadi kesalahan saat mencopot {name}:\n{e}")
 
         self.executor.submit(_worker)
+
 
     def _cancel_native_app_action(self, app_id, item):
         name = item.get("name", "Software")
@@ -3380,6 +3849,7 @@ class DevAICleanerApp(ctk.CTk):
         btn_cancel = self.native_app_cancel_buttons.get(app_id)
         if btn_cancel and btn_cancel.winfo_exists():
             btn_cancel.configure(state="disabled")
+
 
     def _download_and_install_native_app_async(self, item):
         app_id = item.get("id")
@@ -3595,128 +4065,6 @@ class DevAICleanerApp(ctk.CTk):
 
         self.executor.submit(_worker)
 
-    # --- Ghost Toolbox Action Handlers ---
-    def apply_ultimate_performance(self):
-        self.log("Menjalankan aktivasi Ultimate Performance Power Plan...")
-        def _bg():
-            cmd = "powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            self.log(f"powercfg: {res.stdout.strip() or res.stderr.strip()}")
-            # Find and set active
-            guid_match = re.search(r'([a-f0-9\-]{36})', res.stdout, re.IGNORECASE)
-            if guid_match:
-                guid = guid_match.group(1)
-                subprocess.run(f"powercfg /setactive {guid}", shell=True)
-                self.log(f"SUKSES: Skema daya Ultimate Performance ({guid}) diaktifkan!")
-                messagebox.showinfo("Power Plan", "Ultimate Performance Power Plan berhasil diaktifkan!")
-            else:
-                self.log("Skema daya Ultimate Performance telah dibuat di sistem.")
-        self.executor.submit(_bg)
-
-    def disable_gamedvr(self):
-        self.log("Menonaktifkan GameDVR dan Windows Game Bar Capture...")
-        def _bg():
-            try:
-                # HKCU\System\GameConfigStore
-                k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"System\GameConfigStore", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k, "GameDVR_Enabled", 0, winreg.REG_DWORD, 0)
-                winreg.SetValueEx(k, "GameDVR_FSEBehaviorMode", 0, winreg.REG_DWORD, 2)
-
-                # HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR
-                k2 = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\GameDVR", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k2, "AllowGameDVR", 0, winreg.REG_DWORD, 0)
-
-                self.log("SUKSES: GameDVR background recording dinonaktifkan.")
-                messagebox.showinfo("GameDVR", "GameDVR & Xbox Background Recording berhasil dinonaktifkan!")
-            except Exception as e:
-                self.log(f"Gagal tweak GameDVR: {e}")
-        self.executor.submit(_bg)
-
-    def disable_telemetry(self):
-        self.log("Menonaktifkan Windows Telemetry & Diagnostic Data...")
-        def _bg():
-            try:
-                # HKLM DataCollection
-                k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k, "AllowTelemetry", 0, winreg.REG_DWORD, 0)
-
-                # Stop DiagTrack service
-                subprocess.run(["sc.exe", "stop", "DiagTrack"], capture_output=True)
-                subprocess.run(["sc.exe", "config", "DiagTrack", "start=", "disabled"], capture_output=True)
-
-                self.log("SUKSES: Windows Telemetry disetel ke minimal/mati dan DiagTrack dinonaktifkan.")
-                messagebox.showinfo("Telemetry", "Windows Diagnostic & Telemetry tracking berhasil dinonaktifkan!")
-            except Exception as e:
-                self.log(f"Gagal tweak Telemetry: {e}")
-        self.executor.submit(_bg)
-
-    def disable_bing_start(self):
-        self.log("Menonaktifkan Bing Web Search di Start Menu...")
-        def _bg():
-            try:
-                k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Policies\Microsoft\Windows\Explorer", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k, "DisableSearchBoxSuggestions", 0, winreg.REG_DWORD, 1)
-
-                k2 = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Search", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k2, "BingSearchEnabled", 0, winreg.REG_DWORD, 0)
-                winreg.SetValueEx(k2, "CortanaConsent", 0, winreg.REG_DWORD, 0)
-
-                self.log("SUKSES: Bing Web Search Start Menu dinonaktifkan.")
-                messagebox.showinfo("Start Menu", "Pencarian web Bing di Start Menu berhasil dinonaktifkan!")
-            except Exception as e:
-                self.log(f"Gagal tweak Bing search: {e}")
-        self.executor.submit(_bg)
-
-    def apply_dns_flush(self):
-        self.log("Menjalankan ipconfig /flushdns...")
-        def _bg():
-            res = subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True)
-            self.log(f"DNS Flush: {res.stdout.strip() or res.stderr.strip()}")
-            messagebox.showinfo("DNS Flush", "Cache Resolver DNS Windows berhasil dibersihkan!")
-        self.executor.submit(_bg)
-
-    def run_dism_cleanup(self):
-        msg = "Proses DISM Component Cleanup akan menghapus cadangan update Windows lama di C:\\Windows\\WinSxS.\nProses membutuhkan waktu 3-8 menit.\n\nLanjutkan?"
-        if not messagebox.askyesno("DISM Cleanup", msg):
-            return
-        self.log("Memulai DISM /online /cleanup-image /startcomponentcleanup /resetbase...")
-        def _bg():
-            p = subprocess.Popen(
-                ["dism.exe", "/online", "/cleanup-image", "/startcomponentcleanup", "/resetbase"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            for line in iter(p.stdout.readline, ''):
-                if line.strip():
-                    self.log(f"[DISM] {line.strip()}")
-            p.stdout.close()
-            p.wait()
-            self.log(f"DISM Selesai dengan kode status: {p.returncode}")
-            messagebox.showinfo("DISM Cleanup", "Pembersihan toko komponen WinSxS selesai!")
-        self.executor.submit(_bg)
-
-    def run_sfc_scan(self):
-        if not messagebox.askyesno("SFC Scan", "Jalankan 'sfc /scannow' untuk memindai integritas file sistem Windows?"):
-            return
-        self.log("Memulai sfc /scannow...")
-        def _bg():
-            p = subprocess.Popen(
-                ["sfc.exe", "/scannow"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            for line in iter(p.stdout.readline, ''):
-                if line.strip():
-                    self.log(f"[SFC] {line.strip()}")
-            p.stdout.close()
-            p.wait()
-            self.log(f"SFC Scan Selesai dengan kode status: {p.returncode}")
-            messagebox.showinfo("SFC Scan", "Pemeriksaan integritas file sistem Windows selesai!")
-        self.executor.submit(_bg)
 
     def run_dism_restorehealth(self):
         if not messagebox.askyesno("DISM RestoreHealth", "Jalankan 'dism /online /cleanup-image /restorehealth' untuk memperbaiki Windows Image via online?"):
@@ -3728,7 +4076,7 @@ class DevAICleanerApp(ctk.CTk):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                creationflags=hidden_console_creation_flags()
             )
             for line in iter(p.stdout.readline, ''):
                 if line.strip():
@@ -3739,11 +4087,12 @@ class DevAICleanerApp(ctk.CTk):
             messagebox.showinfo("DISM RestoreHealth", "Perbaikan citra sistem Windows selesai!")
         self.executor.submit(_bg)
 
+
     def clean_windows_update_cache(self):
         self.log("Membersihkan cache instalasi Windows Update...")
         def _bg():
             try:
-                subprocess.run(["sc.exe", "stop", "wuauserv"], capture_output=True)
+                subprocess.run(["sc.exe", "stop", "wuauserv"], capture_output=True, creationflags=hidden_console_creation_flags())
                 time.sleep(1)
                 cache_dir = os.path.join(os.getenv("WINDIR", "C:\\Windows"), "SoftwareDistribution", "Download")
                 freed = 0
@@ -3760,12 +4109,13 @@ class DevAICleanerApp(ctk.CTk):
                                 shutil.rmtree(os.path.join(root, d), ignore_errors=True)
                             except Exception:
                                 pass
-                subprocess.run(["sc.exe", "start", "wuauserv"], capture_output=True)
+                subprocess.run(["sc.exe", "start", "wuauserv"], capture_output=True, creationflags=hidden_console_creation_flags())
                 self.log(f"SUKSES: Cache update dibersihkan ({format_size(freed)} ruang disk dihemat).")
                 messagebox.showinfo("Windows Update Cache", f"Cache update berhasil dibersihkan! {format_size(freed)} dihemat.")
             except Exception as e:
                 self.log(f"Gagal membersihkan cache update: {e}")
         self.executor.submit(_bg)
+
 
     def check_vcredist_status(self):
         try:
@@ -3777,93 +4127,16 @@ class DevAICleanerApp(ctk.CTk):
             pass
         return "Belum Terdeteksi"
 
+
     def check_dotnet_status(self):
         try:
-            res = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True)
+            res = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, creationflags=hidden_console_creation_flags())
             if res.returncode == 0 and "Microsoft.WindowsDesktop.App" in res.stdout:
                 return "Terinstal (.NET Desktop)"
         except Exception:
             pass
         return "Siap Diinstal"
 
-    def _setup_ghost_link_checker_view(self):
-        container = self.ghost_frames["link_checker"]
-
-        # Header bar with search, filter, and action buttons
-        header_bar = ctk.CTkFrame(container, corner_radius=6, fg_color="#18191C", height=46)
-        header_bar.pack(fill="x", padx=0, pady=(0, 6))
-        header_bar.pack_propagate(False)
-
-        ctk.CTkLabel(
-            header_bar,
-            text="Ghost Toolbox Apps & Download URL Directory:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#38BDF8"
-        ).pack(side="left", padx=12, pady=10)
-
-        # Search Entry
-        self.ghost_url_search = ctk.CTkEntry(
-            header_bar,
-            placeholder_text="Cari aplikasi atau link...",
-            width=220,
-            height=28,
-            font=ctk.CTkFont(size=11)
-        )
-        self.ghost_url_search.pack(side="left", padx=6, pady=9)
-        self.ghost_url_search.bind("<KeyRelease>", lambda e: self._filter_ghost_url_table())
-
-        # Category Filter
-        self.ghost_url_cat_filter = ctk.CTkComboBox(
-            header_bar,
-            values=["Semua Kategori", "Tools & Tweaks", "Windows Recovery", "Essential Runtimes", "Web Browsers", "Gaming & Social", "Cloud Storage", "Ghost Engine / Downloader"],
-            width=160,
-            height=28,
-            font=ctk.CTkFont(size=11),
-            command=lambda v: self._filter_ghost_url_table()
-        )
-        self.ghost_url_cat_filter.pack(side="left", padx=6, pady=9)
-
-        # Counter Label
-        self.lbl_ghost_url_count = ctk.CTkLabel(
-            header_bar,
-            text="0 / 0 URL",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#94A3B8"
-        )
-        self.lbl_ghost_url_count.pack(side="left", padx=8, pady=10)
-
-        # Action: Check Links Concurrently
-        btn_check_all = ctk.CTkButton(
-            header_bar,
-            text="⚡ Cek Status Link",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="#0284C7",
-            hover_color="#0369A1",
-            width=130,
-            height=28,
-            command=self.check_all_ghost_urls_async
-        )
-        btn_check_all.pack(side="right", padx=10, pady=9)
-
-        # Table Column Header
-        col_hdr = ctk.CTkFrame(container, corner_radius=4, fg_color="#0F172A", height=28)
-        col_hdr.pack(fill="x", padx=0, pady=(0, 2))
-        col_hdr.pack_propagate(False)
-
-        ctk.CTkLabel(col_hdr, text="Kategori", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748B", width=120, anchor="w").pack(side="left", padx=(10, 4))
-        ctk.CTkLabel(col_hdr, text="Nama Aplikasi / Modul", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748B", width=220, anchor="w").pack(side="left", padx=4)
-        ctk.CTkLabel(col_hdr, text="URL Download Resmi", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748B", anchor="w").pack(side="left", fill="x", expand=True, padx=4)
-        ctk.CTkLabel(col_hdr, text="Status", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748B", width=90, anchor="center").pack(side="right", padx=(4, 90))
-        ctk.CTkLabel(col_hdr, text="Aksi", font=ctk.CTkFont(size=11, weight="bold"), text_color="#64748B", width=75, anchor="center").pack(side="right", padx=(4, 10))
-
-        # Scrollable rows frame
-        self.ghost_url_table_frame = ctk.CTkScrollableFrame(container, fg_color="transparent")
-        self.ghost_url_table_frame.pack(fill="both", expand=True, padx=0, pady=0)
-
-        # Load URLs from json
-        self.ghost_url_data = []
-        self.ghost_url_status_labels = {}
-        self._load_ghost_urls_data()
 
     def _load_ghost_urls_data(self):
         json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghost_toolbox_urls.json")
@@ -3879,6 +4152,7 @@ class DevAICleanerApp(ctk.CTk):
                 self.ghost_url_data = []
 
         self._render_ghost_url_table(self.ghost_url_data)
+
 
     def _render_ghost_url_table(self, items):
         for widget in self.ghost_url_table_frame.winfo_children():
@@ -3963,6 +4237,7 @@ class DevAICleanerApp(ctk.CTk):
             )
             info_lbl.pack(pady=8)
 
+
     def _filter_ghost_url_table(self):
         query = self.ghost_url_search.get().lower().strip()
         cat = self.ghost_url_cat_filter.get()
@@ -3977,6 +4252,7 @@ class DevAICleanerApp(ctk.CTk):
             filtered.append(it)
 
         self._render_ghost_url_table(filtered)
+
 
     def check_all_ghost_urls_async(self):
         self.log("Memulai pengecekan live vs dead link untuk URL Ghost Toolbox...")
@@ -4021,6 +4297,7 @@ class DevAICleanerApp(ctk.CTk):
 
         self.executor.submit(_check_worker)
 
+
     def install_runtime_winget(self, pkg_id):
         self.log(f"Menjalankan instalasi paket runtime: winget install {pkg_id}...")
         def _bg():
@@ -4033,6 +4310,8 @@ class DevAICleanerApp(ctk.CTk):
                 self.log(f"Winget: {res.stdout.strip() or res.stderr.strip()}")
                 messagebox.showinfo("Info Winget", f"Proses installer telah dijalankan.\n{res.stdout[:150]}")
         self.executor.submit(_bg)
+
+
     def setup_log_drawer(self):
         log_frame = ctk.CTkFrame(self.content_area, corner_radius=8, fg_color="#18191C", height=100)
         log_frame.pack(fill="x", padx=12, pady=(6, 10))
@@ -4050,6 +4329,7 @@ class DevAICleanerApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(log_frame, font=ctk.CTkFont(family="Consolas", size=10), fg_color="#0F172A", text_color="#CBD5E1")
         self.log_box.pack(fill="both", expand=True, padx=8, pady=(2, 6))
 
+
     def log(self, text):
         def _append():
             ts = time.strftime("%H:%M:%S")
@@ -4057,11 +4337,9 @@ class DevAICleanerApp(ctk.CTk):
             self.log_box.see("end")
         self.after(0, _append)
 
+
     def clear_log(self):
         self.log_box.delete("1.0", "end")
-
-    def auto_initial_scan(self):
-        self.start_smart_scan_async()
 
 
 if __name__ == "__main__":
